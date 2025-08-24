@@ -1,4 +1,4 @@
-# =============== KriptoAlper — SCANNER v6 (Futures-only • DynTop100 • noVision • JSON-hardening) ===============
+# =============== KriptoAlper — SCANNER v7 (Futures-only • RollingScan • DynTop100 • JSON-hardening) ===============
 # Çalıştırma: app.py içinden main() çağrılıyor. Render'da WEB_CONCURRENCY=1 olmalı.
 # ENV: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # Bağımlılıklar: requests, pandas, python-dotenv
@@ -12,7 +12,7 @@ from requests.exceptions import RequestException, SSLError, ConnectionError, Tim
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = "v6-fapi-hardening"
+VERSION = "v7-rolling"
 BOT_NAME = "KriptoAlper"
 
 # ---------- EVREN ----------
@@ -40,17 +40,17 @@ RISK_PER_TRADE_PCT   = 5.0
 FUTURES_BALANCE_USDT = 20.0
 MAX_LEVERAGE_CAP     = 10
 
-# ---------- FİLTRELER ----------
+# ---------- FİLTRELER (gevşetilmiş) ----------
 ATRP_LOW         = 0.008
-ATRP_HIGH        = 0.028
-BREAK_BUFFER_ATR = 0.05
+ATRP_HIGH        = 0.032   # 0.028 → 0.032
+BREAK_BUFFER_ATR = 0.04    # 0.05 → 0.04
 RETEST_TOL_ATR   = 0.15
-VOL_BOOST_MIN    = 1.30
+VOL_BOOST_MIN    = 1.15    # 1.30 → 1.15
 TAKER_LONG_MIN   = 0.55
 TAKER_SHORT_MAX  = 0.45
 
 # ---------- SKOR / KAPILAR ----------
-MIN_CONF_SEND      = 70
+MIN_CONF_SEND      = 65    # 70 → 65
 HIGH_CONF_FOR_10X  = 80
 EMASLOPE_ATR1H_EPS = 0.02
 
@@ -63,12 +63,17 @@ TIMEOUT_HOURS        = 6.0
 GLOBAL_SPIKE_PCT_5M  = 0.008
 COOLDOWN_BARS        = 1
 MAX_OPEN_SIGNALS     = 1
-SCAN_INTERVAL_SEC    = 120
+SCAN_INTERVAL_SEC    = 120     # Rolling kapalıysa devrede
 UNIVERSE_REFRESH_SEC = 1800
 KLINES_CACHE_TTL     = 60
 REQ_SLEEP_SEC        = 0.30
 MAX_TRIES_PER_CALL   = 5
 MSG_INCLUDE_REASONS  = 0  # 0=sade mesaj
+
+# ---------- ROLLING SCAN (sürekli tarama) ----------
+ROLLING_MODE   = True
+BATCH_SIZE     = 12       # her mini turda taranacak sembol sayısı
+BATCH_PAUSE_SEC= 5        # mini turlar arası bekleme
 
 # ---------- TELEGRAM ----------
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
@@ -214,7 +219,7 @@ def get_top_symbols_usdtm(top_n=TOP_N, min_qv=MIN_QUOTE_VOL_USDT):
         pairs = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT"): 
+            if not sym.endswith("USDT"):
                 continue
             qv = float(t.get("quoteVolume", 0) or 0.0)
             if qv >= min_qv:
@@ -495,6 +500,7 @@ def main():
     threading.Thread(target=fapi_monitor_loop, daemon=True).start()
 
     last_universe_ts = 0
+    roll_idx = 0  # rolling pointer
     symbols = STATIC_SYMBOLS[:] if STATIC_SYMBOLS else (FALLBACK_FAVORITES[:] if not USE_DYNAMIC_UNIVERSE else [])
 
     while True:
@@ -502,6 +508,7 @@ def main():
             if time.time() < _global_lock_until:
                 time.sleep(5); continue
 
+            # evreni güncelle
             if STATIC_SYMBOLS:
                 symbols = STATIC_SYMBOLS[:]
             elif USE_DYNAMIC_UNIVERSE and (time.time()-last_universe_ts > UNIVERSE_REFRESH_SEC or not symbols):
@@ -511,12 +518,27 @@ def main():
                     print("[UNIVERSE ERR]", repr(e))
                     symbols = FALLBACK_FAVORITES[:min(TOP_N, len(FALLBACK_FAVORITES))]
                 last_universe_ts = time.time()
+                roll_idx = 0  # evren değişince başa sar
 
             allowed_side = btc_regime()
-            if allowed_side is None: time.sleep(5); continue
+            if allowed_side is None:
+                time.sleep(5); continue
 
-            scan_once(symbols, allowed_side)
-            time.sleep(SCAN_INTERVAL_SEC)
+            if ROLLING_MODE:
+                if not symbols:
+                    time.sleep(2); continue
+                end = min(len(symbols), roll_idx + BATCH_SIZE)
+                batch = symbols[roll_idx:end]
+                if not batch:
+                    roll_idx = 0
+                    batch = symbols[:min(BATCH_SIZE, len(symbols))]
+                scan_once(batch, allowed_side)
+                roll_idx = (roll_idx + BATCH_SIZE) % max(1, len(symbols))
+                time.sleep(BATCH_PAUSE_SEC)
+            else:
+                scan_once(symbols, allowed_side)
+                time.sleep(SCAN_INTERVAL_SEC)
+
         except KeyboardInterrupt:
             print("[STOP] keyboard interrupt"); break
         except Exception as e:
