@@ -1,4 +1,4 @@
-# =============== KriptoAlper — SCANNER v7 (Futures-only • RollingScan • DynTop100 • JSON-hardening) ===============
+# =============== KriptoAlper — SCANNER v7.1 (Futures-only • RollingScan • DynTopN • WAF-safe JSON) ===============
 # Çalıştırma: app.py içinden main() çağrılıyor. Render'da WEB_CONCURRENCY=1 olmalı.
 # ENV: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # Bağımlılıklar: requests, pandas, python-dotenv
@@ -12,12 +12,12 @@ from requests.exceptions import RequestException, SSLError, ConnectionError, Tim
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = "v7-rolling"
+VERSION = "v7.1-rolling-waf"
 BOT_NAME = "KriptoAlper"
 
 # ---------- EVREN ----------
 USE_DYNAMIC_UNIVERSE = True
-TOP_N = 100
+TOP_N = 60  # daha az agresif tarama için 60; 100 istersen burada 100 yap, BATCH_SIZE/Pause'u da ayarla
 MIN_QUOTE_VOL_USDT = 150_000_000
 FALLBACK_FAVORITES = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","LINKUSDT","LTCUSDT",
@@ -40,7 +40,7 @@ RISK_PER_TRADE_PCT   = 5.0
 FUTURES_BALANCE_USDT = 20.0
 MAX_LEVERAGE_CAP     = 10
 
-# ---------- FİLTRELER (gevşetilmiş) ----------
+# ---------- FİLTRELER (biraz gevşek) ----------
 ATRP_LOW         = 0.008
 ATRP_HIGH        = 0.032   # 0.028 → 0.032
 BREAK_BUFFER_ATR = 0.04    # 0.05 → 0.04
@@ -66,31 +66,36 @@ MAX_OPEN_SIGNALS     = 1
 SCAN_INTERVAL_SEC    = 120     # Rolling kapalıysa devrede
 UNIVERSE_REFRESH_SEC = 1800
 KLINES_CACHE_TTL     = 60
-REQ_SLEEP_SEC        = 0.30
+REQ_SLEEP_SEC        = 0.45    # 0.30 → 0.45 (WAF daha az tetiklenir)
 MAX_TRIES_PER_CALL   = 5
 MSG_INCLUDE_REASONS  = 0  # 0=sade mesaj
 
 # ---------- ROLLING SCAN (sürekli tarama) ----------
-ROLLING_MODE   = True
-BATCH_SIZE     = 12       # her mini turda taranacak sembol sayısı
-BATCH_PAUSE_SEC= 5        # mini turlar arası bekleme
+ROLLING_MODE    = True
+BATCH_SIZE      = 8        # 12 → 8
+BATCH_PAUSE_SEC = 6        # 5 → 6
 
 # ---------- TELEGRAM ----------
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ---------- FUTURES ENDPOINTLER (binance-vision YOK) ----------
+# ---------- FUTURES ENDPOINTLER (binance-vision YOK + web-origin fallback) ----------
 BINANCE_FAPI_ENDPOINTS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
     "https://fapi3.binance.com",
+    # WAF/redirect durumunda JSON'u web origin'den de deneyelim
+    "https://www.binance.com",
 ]
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
     "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
     "Connection": "keep-alive",
 })
 SESSION.trust_env = True
@@ -122,26 +127,38 @@ def tg_send(text: str):
     except Exception as e:
         print("[TG ERR]", repr(e))
 
-# ---------- HTTP (JSON-hardening + ayrıntılı hata logu) ----------
+# ---------- HTTP (WAF-aware + JSON-hardening) ----------
 def _short(s: str, n: int = 180) -> str:
     return (s or "")[:n].replace("\n", " ").replace("\r", " ")
 
 def http_get(path: str, params: dict | None = None):
-    """Futures-only GET; JSON değilse/redirectse/boşsa endpoint değiştirir.
-       Her denemede hata tipini ve kısa gövde snippeti loglar.
-       5+ ardışık fail'de TG'ye uyarı atar (30dk'da 1 kez)."""
+    """
+    Futures-only GET; JSON değilse/redirectse endpoint değiştirir.
+    302 ile www.binance.com'a yönlenirse, aynı path'i web-origin'de
+    (Origin/Referer set ederek) bir kez daha dener.
+    5+ ardışık fail'de TG'ye uyarı atar (30dk'da 1 kez).
+    """
     global _fapi_fail_count, _last_fapi_alert, _last_http_err_log
     params = params or {}
     last_exc = None
 
     for base in BINANCE_FAPI_ENDPOINTS:
-        url = base + path
+        url = (base + path) if not base.endswith("www.binance.com") else ("https://www.binance.com" + path)
+
         try:
-            r = SESSION.get(url, params=params, timeout=15, allow_redirects=False)
+            extra_headers = {}
+            if base.endswith("www.binance.com"):
+                extra_headers = {
+                    "Origin":  "https://www.binance.com",
+                    "Referer": "https://www.binance.com/en/futures",
+                }
+
+            r = SESSION.get(url, params=params, timeout=15, allow_redirects=False, headers=extra_headers or None)
 
             if r.status_code in (451, 418):
                 print(f"[HTTP WARN] blocked status={r.status_code} url={url}")
                 continue
+
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
                 print(f"[HTTP WARN] redirect status={r.status_code} url={url} -> {loc}")
@@ -154,17 +171,17 @@ def http_get(path: str, params: dict | None = None):
 
             ct = (r.headers.get("Content-Type") or "").lower()
             if "json" not in ct:
-                print(f"[HTTP WARN] non-json ct='{ct}' url={url} body[:180]={_short(r.text)}")
+                print(f"[HTTP WARN] non-json ct='{ct}' url={url} body[:160]={_short(r.text,160)}")
                 raise ValueError("non-json response")
 
             try:
                 data = r.json()
-            except ValueError as je:
-                print(f"[HTTP WARN] json-decode-fail url={url} body[:180]={_short(r.text)}")
+            except ValueError:
+                print(f"[HTTP WARN] json-decode-fail url={url} body[:160]={_short(r.text,160)}")
                 raise
 
             time.sleep(REQ_SLEEP_SEC)
-            _fapi_fail_count = 0  # success → reset
+            _fapi_fail_count = 0
             return data
 
         except (Timeout, SSLError, ConnectionError, RequestException, ValueError) as e:
@@ -178,7 +195,7 @@ def http_get(path: str, params: dict | None = None):
 
     _fapi_fail_count += 1
     if _fapi_fail_count >= 5 and (time.time() - _last_fapi_alert > 1800):
-        tg_send("🔴 Binance FAPI erişilemiyor/yanıt geçersiz. Tarama beklemede (ağ engeli olası).")
+        tg_send("🔴 Binance FAPI erişilemiyor/JSON alınamadı. Tarama beklemede (WAF/geo engeli olası).")
         _last_fapi_alert = time.time()
     raise last_exc or RuntimeError("HTTP GET failed")
 
@@ -219,7 +236,7 @@ def get_top_symbols_usdtm(top_n=TOP_N, min_qv=MIN_QUOTE_VOL_USDT):
         pairs = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
+            if not sym.endswith("USDT"): 
                 continue
             qv = float(t.get("quoteVolume", 0) or 0.0)
             if qv >= min_qv:
@@ -365,7 +382,7 @@ def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_si
     if conf < MIN_CONF_SEND: return None
 
     qty = round_qty(symbol, ((RISK_PER_TRADE_PCT/100.0) * FUTURES_BALANCE_USDT) / max(1e-9, stop_dist))
-    notional = qty * entry
+    notional = qty * entry  # bilgi amaçlı
     lev_bucket = 10 if (conf >= HIGH_CONF_FOR_10X and (atrv/max(1e-9,price)) <= 0.012) else 5
 
     return {
