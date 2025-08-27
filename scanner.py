@@ -1,23 +1,22 @@
-# =============== KriptoAlper — SCANNER v7.1 (Futures-only • RollingScan • DynTopN • WAF-safe JSON) ===============
-# Çalıştırma: app.py içinden main() çağrılıyor. Render'da WEB_CONCURRENCY=1 olmalı.
-# ENV: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# Bağımlılıklar: requests, pandas, python-dotenv
+# =============== KriptoAlper — SCANNER v7.3 (Akış+ • Futures • RollingScan • DynTopN • WAF-safe + Adaptive Throttle) ===============
+# Start: gunicorn -k gthread -w 1 -b 0.0.0.0:$PORT app:app
+# ENV: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (opsiyonel: TZ=Europe/Istanbul)
+# Dep: requests, pandas, python-dotenv
 
 import os, time, math, random, traceback, threading
 from collections import defaultdict, deque
-
 import pandas as pd
 import requests
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = "v7.1-rolling-waf"
+VERSION  = "v7.3-akisplus"
 BOT_NAME = "KriptoAlper"
 
 # ---------- EVREN ----------
 USE_DYNAMIC_UNIVERSE = True
-TOP_N = 60  # daha az agresif tarama için 60; 100 istersen burada 100 yap, BATCH_SIZE/Pause'u da ayarla
+TOP_N = 80  # daha çok fırsat için 80; istersen 60/100 yapabilirsin
 MIN_QUOTE_VOL_USDT = 150_000_000
 FALLBACK_FAVORITES = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","LINKUSDT","LTCUSDT",
@@ -26,7 +25,7 @@ FALLBACK_FAVORITES = [
     "TONUSDT","ORDIUSDT","PEPEUSDT","WIFUSDT","BCHUSDT","ETCUSDT","XLMUSDT","SANDUSDT","THETAUSDT","CHRUSDT",
     "RUNEUSDT","KASUSDT","NEOUSDT","STXUSDT","IMXUSDT","DYDXUSDT","GALAUSDT","FLOWUSDT","APEUSDT","CELOUSDT"
 ]
-STATIC_SYMBOLS = []  # sabitlemek istersen buraya yaz
+STATIC_SYMBOLS = []  # sabitlemek istersen doldur
 
 # ---------- ZAMAN DİLİMLERİ ----------
 INTERVAL   = "15m"
@@ -35,24 +34,29 @@ CONFIRM_TF = "1h"
 # ---------- RİSK / TP-SL ----------
 ATR_MULT_SL = 1.3
 ATR_MULT_TP = 2.0
-MIN_SEND_RR = 1.50
+MIN_SEND_RR = 1.40        # Akış+ (1.50 → 1.40)
 RISK_PER_TRADE_PCT   = 5.0
 FUTURES_BALANCE_USDT = 20.0
 MAX_LEVERAGE_CAP     = 10
 
-# ---------- FİLTRELER (biraz gevşek) ----------
+# ---------- FİLTRELER (Akış+) ----------
 ATRP_LOW         = 0.008
-ATRP_HIGH        = 0.032   # 0.028 → 0.032
-BREAK_BUFFER_ATR = 0.04    # 0.05 → 0.04
-RETEST_TOL_ATR   = 0.15
-VOL_BOOST_MIN    = 1.15    # 1.30 → 1.15
+ATRP_HIGH        = 0.036   # 0.032 → 0.036 (biraz daha oynaklığa izin)
+BREAK_BUFFER_ATR = 0.03    # 0.04 → 0.03 (kırılım mesafesi)
+RETEST_TOL_ATR   = 0.20    # 0.15 → 0.20 (retest toleransı)
+VOL_BOOST_MIN    = 1.05    # 1.15 → 1.05 (hacim şartı daha yumuşak)
 TAKER_LONG_MIN   = 0.55
 TAKER_SHORT_MAX  = 0.45
 
 # ---------- SKOR / KAPILAR ----------
-MIN_CONF_SEND      = 65    # 70 → 65
+MIN_CONF_SEND      = 60    # 65 → 60
 HIGH_CONF_FOR_10X  = 80
-EMASLOPE_ATR1H_EPS = 0.02
+EMASLOPE_ATR1H_EPS = 0.01  # 0.02 → 0.01 (rejim daha sık yön verir)
+
+# ---------- REGİM MODU ----------
+# STRICT: BTC 1h trend yoksa sinyal verme
+# LOOSE : BTC flat ise her iki yöne izin ver (BOTH)
+REGIME_MODE = "LOOSE"
 
 # ---------- HEARTBEAT ----------
 HEARTBEAT_MIN  = 30
@@ -63,30 +67,40 @@ TIMEOUT_HOURS        = 6.0
 GLOBAL_SPIKE_PCT_5M  = 0.008
 COOLDOWN_BARS        = 1
 MAX_OPEN_SIGNALS     = 1
-SCAN_INTERVAL_SEC    = 120     # Rolling kapalıysa devrede
+SCAN_INTERVAL_SEC    = 120
 UNIVERSE_REFRESH_SEC = 1800
-KLINES_CACHE_TTL     = 60
-REQ_SLEEP_SEC        = 0.45    # 0.30 → 0.45 (WAF daha az tetiklenir)
+KLINES_CACHE_TTL     = 90     # daha az istek
+REQ_SLEEP_SEC        = 0.60   # WAF güvenli
 MAX_TRIES_PER_CALL   = 5
-MSG_INCLUDE_REASONS  = 0  # 0=sade mesaj
+MSG_INCLUDE_REASONS  = 0
 
-# ---------- ROLLING SCAN (sürekli tarama) ----------
+# ---------- ROLLING SCAN ----------
 ROLLING_MODE    = True
-BATCH_SIZE      = 8        # 12 → 8
-BATCH_PAUSE_SEC = 6        # 5 → 6
+BATCH_SIZE      = 6
+BATCH_PAUSE_SEC = 7
+
+# ---------- ADAPTİF WAF THROTTLE ----------
+ADAPTIVE_WAF = True
+BASE_BATCH_SIZE      = BATCH_SIZE
+BASE_BATCH_PAUSE     = BATCH_PAUSE_SEC
+BASE_REQ_SLEEP       = REQ_SLEEP_SEC
+MIN_BATCH_SIZE       = 4
+MAX_BATCH_PAUSE      = 12
+MAX_REQ_SLEEP        = 0.85
+WAF_FAIL_STEP        = 3
+WAF_DECAY_SEC        = 300
 
 # ---------- TELEGRAM ----------
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ---------- FUTURES ENDPOINTLER (binance-vision YOK + web-origin fallback) ----------
+# ---------- ENDPOINTLER (binance-vision YOK + web-origin fallback) ----------
 BINANCE_FAPI_ENDPOINTS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
     "https://fapi3.binance.com",
-    # WAF/redirect durumunda JSON'u web origin'den de deneyelim
-    "https://www.binance.com",
+    "https://www.binance.com",  # web-origin fallback
 ]
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -115,6 +129,7 @@ _losses_lookback = defaultdict(lambda: deque(maxlen=3))
 _fapi_fail_count = 0
 _last_fapi_alert = 0
 _last_http_err_log = 0
+_last_adapt = 0
 lock = threading.RLock()
 
 # ---------- TELEGRAM ----------
@@ -127,16 +142,43 @@ def tg_send(text: str):
     except Exception as e:
         print("[TG ERR]", repr(e))
 
+# ---------- ADAPTİF THROTTLE ----------
+def _adapt_throttle(success: bool):
+    global BATCH_SIZE, BATCH_PAUSE_SEC, REQ_SLEEP_SEC, _last_adapt, _fapi_fail_count
+    if not ADAPTIVE_WAF: return
+    now = time.time()
+    changed = False
+
+    if not success:
+        if _fapi_fail_count >= WAF_FAIL_STEP and (now - _last_adapt) > 8:
+            new_batch = max(MIN_BATCH_SIZE, BATCH_SIZE - 1)
+            new_pause = min(MAX_BATCH_PAUSE, BATCH_PAUSE_SEC + 1)
+            new_sleep = min(MAX_REQ_SLEEP, round(REQ_SLEEP_SEC + 0.05, 2))
+            if (new_batch, new_pause, new_sleep) != (BATCH_SIZE, BATCH_PAUSE_SEC, REQ_SLEEP_SEC):
+                BATCH_SIZE, BATCH_PAUSE_SEC, REQ_SLEEP_SEC = new_batch, new_pause, new_sleep
+                changed = True
+    else:
+        if (now - _last_adapt) > WAF_DECAY_SEC:
+            new_batch = min(BASE_BATCH_SIZE, BATCH_SIZE + 1)
+            new_pause = max(BASE_BATCH_PAUSE, BATCH_PAUSE_SEC - 1)
+            new_sleep = max(BASE_REQ_SLEEP, round(REQ_SLEEP_SEC - 0.05, 2))
+            if (new_batch, new_pause, new_sleep) != (BATCH_SIZE, BATCH_PAUSE_SEC, REQ_SLEEP_SEC):
+                BATCH_SIZE, BATCH_PAUSE_SEC, REQ_SLEEP_SEC = new_batch, new_pause, new_sleep
+                changed = True
+
+    if changed:
+        _last_adapt = now
+        print(f"[ADAPT] pacing BATCH={BATCH_SIZE} PAUSE={BATCH_PAUSE_SEC}s REQ_SLEEP={REQ_SLEEP_SEC}s")
+
 # ---------- HTTP (WAF-aware + JSON-hardening) ----------
 def _short(s: str, n: int = 180) -> str:
     return (s or "")[:n].replace("\n", " ").replace("\r", " ")
 
 def http_get(path: str, params: dict | None = None):
     """
-    Futures-only GET; JSON değilse/redirectse endpoint değiştirir.
-    302 ile www.binance.com'a yönlenirse, aynı path'i web-origin'de
-    (Origin/Referer set ederek) bir kez daha dener.
-    5+ ardışık fail'de TG'ye uyarı atar (30dk'da 1 kez).
+    Futures GET; JSON değilse/redirectse endpoint değiştirir.
+    302 → web-origin fallback; 5+ ardışık fail → TG uyarı.
+    Adaptif throttle: success/fail'e göre pacing ayarlanır.
     """
     global _fapi_fail_count, _last_fapi_alert, _last_http_err_log
     params = params or {}
@@ -144,7 +186,6 @@ def http_get(path: str, params: dict | None = None):
 
     for base in BINANCE_FAPI_ENDPOINTS:
         url = (base + path) if not base.endswith("www.binance.com") else ("https://www.binance.com" + path)
-
         try:
             extra_headers = {}
             if base.endswith("www.binance.com"):
@@ -158,12 +199,10 @@ def http_get(path: str, params: dict | None = None):
             if r.status_code in (451, 418):
                 print(f"[HTTP WARN] blocked status={r.status_code} url={url}")
                 continue
-
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
                 print(f"[HTTP WARN] redirect status={r.status_code} url={url} -> {loc}")
                 raise ValueError("redirect to non-json")
-
             if r.status_code == 429:
                 time.sleep(1.0 + random.random()); continue
 
@@ -181,25 +220,27 @@ def http_get(path: str, params: dict | None = None):
                 raise
 
             time.sleep(REQ_SLEEP_SEC)
-            _fapi_fail_count = 0
+            if _fapi_fail_count > 0: _fapi_fail_count = 0
+            _adapt_throttle(success=True)
             return data
 
         except (Timeout, SSLError, ConnectionError, RequestException, ValueError) as e:
             last_exc = e
+            _fapi_fail_count += 1
             now = time.time()
             if now - _last_http_err_log > 10:
                 print(f"[HTTP ERR] url={url} type={type(e).__name__} msg={repr(e)}")
                 _last_http_err_log = now
+            _adapt_throttle(success=False)
             time.sleep(0.35 + random.random()*0.5)
             continue
 
-    _fapi_fail_count += 1
     if _fapi_fail_count >= 5 and (time.time() - _last_fapi_alert > 1800):
         tg_send("🔴 Binance FAPI erişilemiyor/JSON alınamadı. Tarama beklemede (WAF/geo engeli olası).")
         _last_fapi_alert = time.time()
     raise last_exc or RuntimeError("HTTP GET failed")
 
-# ---------- EXCHANGE INFO / YUVARLAMA ----------
+# ---------- EXCHANGE INFO / ROUNDING ----------
 def get_exchange_info():
     global _exchange_info, _exchange_info_time
     if _exchange_info and time.time() - _exchange_info_time < 3600:
@@ -236,7 +277,7 @@ def get_top_symbols_usdtm(top_n=TOP_N, min_qv=MIN_QUOTE_VOL_USDT):
         pairs = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT"): 
+            if not sym.endswith("USDT"):
                 continue
             qv = float(t.get("quoteVolume", 0) or 0.0)
             if qv >= min_qv:
@@ -313,7 +354,7 @@ def candle_wick_ok(df: pd.DataFrame) -> bool:
     return (top <= 0.35*rng) and (bot <= 0.35*rng) and (top <= 0.7*body) and (bot <= 0.7*body)
 
 # ---------- SİNYAL ----------
-def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_side: str | None):
+def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_side):
     close=df15["close"]; high=df15["high"]; low=df15["low"]; vol=df15["volume"]; qav=df15["qav"]
     ema200_15=ema(close,200); ema12=ema(close,12); ema26=ema(close,26); rsi15=rsi(close,14)
     atr15=atr(high,low,close,14); up20,lo20,_=donchian(high,low,20)
@@ -339,23 +380,27 @@ def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_si
     long_break  = (price >= up_v + BREAK_BUFFER_ATR*atrv) and (price > ema200v) and (ema12v > ema26v) and (52 <= rsi_v <= 68) and ((taker_ratio is None) or (taker_ratio >= TAKER_LONG_MIN))
     short_break = (price <= lo_v - BREAK_BUFFER_ATR*atrv) and (price < ema200v) and (ema12v < ema26v) and (32 <= rsi_v <= 48) and ((taker_ratio is None) or (taker_ratio <= TAKER_SHORT_MAX))
     side = "LONG" if long_break else ("SHORT" if short_break else None)
-    if side is None or allowed_side is None or side != allowed_side:
-        return None
+    if side is None: return None
+    if allowed_side not in (None, "BOTH", side): return None  # LOOSE modda BOTH serbest
 
+    # EMA200 yakınında ters yön giriş yok
     if side == "LONG" and price < ema200v + 0.2*atrv: return None
     if side == "SHORT" and price > ema200v - 0.2*atrv: return None
 
-    tol=RETEST_TOL_ATR*atrv; recent=df15.tail(3)
+    # kırılım sonrası retest teyidi
+    tol = RETEST_TOL_ATR*atrv; recent=df15.tail(3)
     if side=="LONG":
         if not ((recent["low"]<=up_v+tol).any() and price>=float(df15["open"].iloc[-1])): return None
     else:
         if not ((recent["high"]>=lo_v-tol).any() and price<=float(df15["open"].iloc[-1])): return None
 
+    # 1h trend teyidi
     cl1h=df1h["close"]; ema200_1h=ema(cl1h,200); rsi1h=rsi(cl1h,14)
     slope1h=ema_slope(ema200_1h,5); rsi1h_v=float(rsi1h.iloc[-1])
     if side=="LONG"  and not (slope1h>0 and rsi1h_v>=50): return None
     if side=="SHORT" and not (slope1h<0 and rsi1h_v<=50): return None
 
+    # TP/SL/Entry
     swing_low=float(low.tail(5).min()); swing_high=float(high.tail(5).max())
     if side=="LONG":
         sl=min(price-ATR_MULT_SL*atrv, swing_low-0.1*atrv); tp=price+ATR_MULT_TP*atrv
@@ -369,10 +414,11 @@ def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_si
 
     bars_to_tp=max(1,int(math.ceil(abs(tp-entry)/max(1e-9,atrv)))); est_min=bars_to_tp*15
 
+    # skor
     conf=0
     conf+=25  # 1h teyit
-    conf+=15  # 15m EMA200 ayrışma
-    conf+=15  # hacim patlaması
+    conf+=15  # 15m EMA/konum
+    conf+=15  # hacim
     breakout_strength=abs((price - (up_v if side=="LONG" else lo_v)) / max(1e-9, atrv))
     conf+=min(15, int(7 + 4*breakout_strength))
     conf+=10  # retest
@@ -382,7 +428,6 @@ def build_signal(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, allowed_si
     if conf < MIN_CONF_SEND: return None
 
     qty = round_qty(symbol, ((RISK_PER_TRADE_PCT/100.0) * FUTURES_BALANCE_USDT) / max(1e-9, stop_dist))
-    notional = qty * entry  # bilgi amaçlı
     lev_bucket = 10 if (conf >= HIGH_CONF_FOR_10X and (atrv/max(1e-9,price)) <= 0.012) else 5
 
     return {
@@ -413,8 +458,7 @@ def scan_once(symbols, allowed_side):
             if _last_signal_bar.get(sym, 0) >= last_bar_open and COOLDOWN_BARS > 0: continue
             if len(_open_signals) >= MAX_OPEN_SIGNALS: break
 
-            allowed = allowed_side  # LONG/SHORT/None
-            sig = build_signal(sym, df15, df1h, allowed)
+            sig = build_signal(sym, df15, df1h, allowed_side)
             if not sig: continue
 
             tg_send(fmt_signal_msg(sig))
@@ -496,8 +540,7 @@ def fapi_monitor_loop():
     while True:
         try:
             http_get("/fapi/v1/ping")
-            if fail > 0:
-                print("[FAPI OK] ping recovered")
+            if fail > 0: print("[FAPI OK] ping recovered")
             fail = 0
         except Exception as e:
             fail += 1
@@ -517,7 +560,7 @@ def main():
     threading.Thread(target=fapi_monitor_loop, daemon=True).start()
 
     last_universe_ts = 0
-    roll_idx = 0  # rolling pointer
+    roll_idx = 0
     symbols = STATIC_SYMBOLS[:] if STATIC_SYMBOLS else (FALLBACK_FAVORITES[:] if not USE_DYNAMIC_UNIVERSE else [])
 
     while True:
@@ -535,12 +578,18 @@ def main():
                     print("[UNIVERSE ERR]", repr(e))
                     symbols = FALLBACK_FAVORITES[:min(TOP_N, len(FALLBACK_FAVORITES))]
                 last_universe_ts = time.time()
-                roll_idx = 0  # evren değişince başa sar
+                roll_idx = 0
 
+            # rejim
             allowed_side = btc_regime()
-            if allowed_side is None:
-                time.sleep(5); continue
+            if REGIME_MODE == "STRICT":
+                if allowed_side is None:
+                    time.sleep(5); continue
+            else:  # LOOSE
+                if allowed_side is None:
+                    allowed_side = "BOTH"
 
+            # tarama
             if ROLLING_MODE:
                 if not symbols:
                     time.sleep(2); continue
