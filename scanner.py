@@ -1,4 +1,4 @@
-# =============== KriptoAlper — SCANNER v7.3 (Akış+ • Futures • RollingScan • DynTopN • WAF-safe + Adaptive Throttle) ===============
+# =============== KriptoAlper — SCANNER v7.4 (Akış+ A • Futures • RollingScan • DynTopN • WAF-safe + Adaptive Throttle) ===============
 # Start: gunicorn -k gthread -w 1 -b 0.0.0.0:$PORT app:app
 # ENV: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (opsiyonel: TZ=Europe/Istanbul)
 # Dep: requests, pandas, python-dotenv
@@ -11,7 +11,7 @@ from requests.exceptions import RequestException, SSLError, ConnectionError, Tim
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION  = "v7.3-akisplus"
+VERSION  = "v7.4-akisplus-A"
 BOT_NAME = "KriptoAlper"
 
 # ---------- EVREN ----------
@@ -34,24 +34,24 @@ CONFIRM_TF = "1h"
 # ---------- RİSK / TP-SL ----------
 ATR_MULT_SL = 1.3
 ATR_MULT_TP = 2.0
-MIN_SEND_RR = 1.40        # Akış+ (1.50 → 1.40)
+MIN_SEND_RR = 1.30        # A MODU: 1.40 → 1.30
 RISK_PER_TRADE_PCT   = 5.0
 FUTURES_BALANCE_USDT = 20.0
 MAX_LEVERAGE_CAP     = 10
 
-# ---------- FİLTRELER (Akış+) ----------
+# ---------- FİLTRELER (Akış+ A) ----------
 ATRP_LOW         = 0.008
-ATRP_HIGH        = 0.036   # 0.032 → 0.036 (biraz daha oynaklığa izin)
-BREAK_BUFFER_ATR = 0.03    # 0.04 → 0.03 (kırılım mesafesi)
-RETEST_TOL_ATR   = 0.20    # 0.15 → 0.20 (retest toleransı)
-VOL_BOOST_MIN    = 1.05    # 1.15 → 1.05 (hacim şartı daha yumuşak)
+ATRP_HIGH        = 0.040   # 0.036 → 0.040 (daha oynaklığa izin)
+BREAK_BUFFER_ATR = 0.03    # kırılım mesafesi
+RETEST_TOL_ATR   = 0.20    # retest toleransı
+VOL_BOOST_MIN    = 1.05    # hacim şartı
 TAKER_LONG_MIN   = 0.55
 TAKER_SHORT_MAX  = 0.45
 
 # ---------- SKOR / KAPILAR ----------
-MIN_CONF_SEND      = 60    # 65 → 60
+MIN_CONF_SEND      = 55    # 60 → 55
 HIGH_CONF_FOR_10X  = 80
-EMASLOPE_ATR1H_EPS = 0.01  # 0.02 → 0.01 (rejim daha sık yön verir)
+EMASLOPE_ATR1H_EPS = 0.01
 
 # ---------- REGİM MODU ----------
 # STRICT: BTC 1h trend yoksa sinyal verme
@@ -65,8 +65,8 @@ HEARTBEAT_TEXT = "🟢 KriptoAlper yaşıyor"
 # ---------- GÜVENLİK / PACING ----------
 TIMEOUT_HOURS        = 6.0
 GLOBAL_SPIKE_PCT_5M  = 0.008
-COOLDOWN_BARS        = 1
-MAX_OPEN_SIGNALS     = 1
+COOLDOWN_BARS        = 0     # A MODU: aynı 15m barda ikinci sinyale izin
+MAX_OPEN_SIGNALS     = 2     # A MODU: aynı anda 2 pozisyon
 SCAN_INTERVAL_SEC    = 120
 UNIVERSE_REFRESH_SEC = 1800
 KLINES_CACHE_TTL     = 90     # daha az istek
