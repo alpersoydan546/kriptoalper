@@ -1,4 +1,4 @@
-# ============================ KriptoAlper — SCANNER (15 Coin • ConfBadge • Dynamic Leverage) ============================
+# ============================ KriptoAlper — SCANNER (15 Coin • ConfBadge • Dynamic Leverage • Sharp Targets) ============================
 # Gereksinimler: requests, pandas, numpy, python-dotenv
 # ENV (zorunlu): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # ENV (opsiyonel):
@@ -7,6 +7,7 @@
 #   KLINES_CACHE_TTL=25               (sn)
 #   REQ_SLEEP_SEC=0.22                (istek arası taban gecikme)
 #   MAX_TRIES_PER_CALL=5
+#   FAPI_BASE=https://<worker_or_proxy_domain>  # VARSA: sadece bu host üzerinden FAPI (Cloudflare Worker vb.)
 # Not: Auto-trade YOK; sadece sinyal gönderir.
 
 import os, time, traceback, random, math
@@ -41,9 +42,12 @@ perf_rr_last = deque(maxlen=300)
 # ================== TELEGRAM ==================
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "KriptoAlper/1.0 (+render) python-requests",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 })
 
 def send_tg(text):
@@ -101,20 +105,21 @@ def slope(series, length=15):
     base = np.mean(np.abs(y)) + 1e-9
     return (m / base) * 100
 
-# ================== Sinyal Mantığı ==================
+# ================== Sinyal Mantığı (A Modu ufak gevşetme) ==================
 EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
 RSI_LEN = 14
 ATR_LEN = 14
 
-MIN_RR_SCALP, MIN_RR_SWING = 1.30, 1.80
-MIN_CONF_SCALP, MIN_CONF_SWING = 60, 80    # algoritmik kabul eşiği (gönderim eşiği ayrıca var)
-SLOPE_MIN_BY_TF = {"5m": 0.009, "15m": 0.009, "1h": 0.012, "4h": 0.015}
-DEFAULT_SLOPE_MIN = 0.009
+MIN_RR_SCALP, MIN_RR_SWING = 1.25, 1.70
+MIN_CONF_SCALP, MIN_CONF_SWING = 55, 75
+SLOPE_MIN_BY_TF = {"5m": 0.008, "15m": 0.008, "1h": 0.011, "4h": 0.014}
+DEFAULT_SLOPE_MIN = 0.008
 
-ATR_MULT_SL, ATR_MULT_TP = 1.05, 2.0
+# SL/TP temel çarpanları (Keskin hedef mantığında hibritleşiyor)
+ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.0
 
-# >>> Telegram'a gönderim minimumu
-MIN_SEND_CONF = 60
+# Telegram gönderim alt eşiği
+MIN_SEND_CONF = 55
 
 def confidence_score(rr, slope_abs, rsi_now, tf):
     base = 50
@@ -160,19 +165,24 @@ def fmt_signal_card(parite, tf, yon, price, tp, sl, rr, conf, slope_val, slope_m
 TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
 def estimate_minutes(entry: float, tp: float, atr_now: float, tf: str) -> int:
-    """
-    Hedef mesafesini ATR'e böler → yaklaşık kaç bar gerekir?
-    TF dakikası ile çarp → süre (dk). Volatilite artarsa süre kısalır.
-    """
     dist = abs(tp - entry)
     bars = max(1.0, dist / max(atr_now, 1e-9))
     return int(math.ceil(bars * TF_MINUTES.get(tf, 5)))
 
-# ================== Ağ Katmanı (Anti 451/429) ==================
-SPOT_HOSTS  = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api4.binance.com","https://api-gcp.binance.com","https://data-api.binance.vision","https://api.binance.vision"]
-FAPI_HOSTS  = ["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
+# ================== Ağ Katmanı (Anti 451/429/302) ==================
+SPOT_HOSTS  = [
+    "https://api.binance.com","https://api1.binance.com","https://api2.binance.com",
+    "https://api3.binance.com","https://api4.binance.com","https://api-gcp.binance.com",
+    "https://data-api.binance.vision","https://api.binance.vision"
+]
+FAPI_BASE = os.getenv("FAPI_BASE","").strip()
+if FAPI_BASE:
+    FAPI_HOSTS = [FAPI_BASE.rstrip("/")]
+else:
+    FAPI_HOSTS  = ["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
+
 POOL_CURSOR = {"spot":0, "fapi":0}
-GEO_FORCE_POOL = os.getenv("GEO_FORCE_POOL","spot").lower()   # spot|vision|fapi
+GEO_FORCE_POOL = os.getenv("GEO_FORCE_POOL","spot").lower()
 USE_FAPI_FALLBACK = os.getenv("USE_FAPI_FALLBACK","1") == "1"
 REQ_SLEEP_SEC = float(os.getenv("REQ_SLEEP_SEC","0.22"))
 MAX_TRIES_PER_CALL = int(os.getenv("MAX_TRIES_PER_CALL","5"))
@@ -189,7 +199,6 @@ def _pick_host(pool: str) -> str:
 def _make_url(pool: str, host: str, symbol: str, interval: str) -> str:
     if pool == "fapi":
         return f"{host}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=210"
-    # spot/vision
     return f"{host}/api/v3/klines?symbol={symbol}&interval={interval}&limit=210"
 
 def get_klines(symbol, interval="5m", limit=210):
@@ -201,7 +210,7 @@ def get_klines(symbol, interval="5m", limit=210):
         if DEBUG: print(f"[CACHE] {symbol} {interval} hit")
         return hit[1].copy()
 
-    pools_try = []
+    # havuz planı
     force = GEO_FORCE_POOL
     if force in ("vision","spot"):
         pools_try = ["spot","fapi"] if USE_FAPI_FALLBACK else ["spot"]
@@ -218,36 +227,77 @@ def get_klines(symbol, interval="5m", limit=210):
             url = _make_url(pool, host, symbol, interval)
             try:
                 if DEBUG: print(f"[RATE/GEO] {symbol} {interval} via {host.split('//')[1]} ...", end="")
-                r = SESSION.get(url, timeout=10)
+                headers = {}
+                if pool == "fapi":
+                    headers = {"Origin":"https://www.binance.com","Referer":"https://www.binance.com/en/futures"}
+                r = SESSION.get(url, timeout=12, allow_redirects=False, headers=headers or None)
                 code = r.status_code
+
+                if code in (301,302,303,307,308):
+                    if DEBUG: print(f" {code} (redir)")
+                    time.sleep(REQ_SLEEP_SEC*1.2); tries += 1; continue
+
                 if code == 200:
+                    ct = (r.headers.get("Content-Type","").lower())
+                    if "json" not in ct:
+                        if DEBUG: print(" non-json")
+                        time.sleep(REQ_SLEEP_SEC); tries += 1; continue
                     arr = r.json()
                     cols = ["open_time","open","high","low","close","volume","ct","qv","trades","tb","tq","ig"]
                     df = pd.DataFrame(arr, columns=cols)
                     for c in ["open","high","low","close","volume"]:
-                        df[c] = df[c].astype(float)
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
                     _kl_cache[key] = (now, df)
                     if DEBUG: print(" 200")
                     time.sleep(REQ_SLEEP_SEC + random.random()*0.05)
                     return df.copy()
+
                 elif code in (429, 418):
-                    if DEBUG: print(f" {code} (rate)"); time.sleep(REQ_SLEEP_SEC*1.6 + tries*0.15)
+                    if DEBUG: print(f" {code} (rate)")
+                    time.sleep(REQ_SLEEP_SEC*1.6 + tries*0.2)
+
                 elif code in (451, 403):
                     if DEBUG: print(f" {code} (geo)")
-                    # bu hostu bırak, diğer hosta dene
                     time.sleep(REQ_SLEEP_SEC*1.2)
+
                 else:
                     if DEBUG: print(f" {code}")
                     time.sleep(REQ_SLEEP_SEC)
+
             except Exception as e:
                 last_err = e
                 if DEBUG: print(f" EXC {type(e).__name__}")
                 time.sleep(REQ_SLEEP_SEC)
             tries += 1
-        # pool bitti, bir sonrakine geç
     raise RuntimeError("klines failed") from last_err
 
-# ================== Sinyal Üretimi ==================
+# ================== Keskin Hedef Yardımcıları (YENİ) ==================
+def recent_swing_levels(df, lookback=20):
+    h = float(df["high"].tail(lookback).max())
+    l = float(df["low"].tail(lookback).min())
+    return h, l
+
+def adx14(df):
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plusDM  = np.where((up > dn) & (up > 0), up, 0.0)
+    minusDM = np.where((dn > up) & (dn > 0), -dn, 0.0)
+    tr = np.maximum(df["high"] - df["low"], np.maximum(abs(df["high"] - df["close"].shift()), abs(df["low"] - df["close"].shift())))
+    atr_ = pd.Series(tr).ewm(alpha=1/14, adjust=False).mean()
+    pdi = 100 * pd.Series(plusDM).ewm(alpha=1/14, adjust=False).mean() / (atr_ + 1e-9)
+    mdi = 100 * pd.Series(minusDM).ewm(alpha=1/14, adjust=False).mean() / (atr_ + 1e-9)
+    dx = (100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)).fillna(0)
+    return float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+
+def donchian_prev(df, n=20):
+    up = df["high"].rolling(n).max().iloc[-2]
+    lo = df["low"].rolling(n).min().iloc[-2]
+    return float(up), float(lo)
+
+def front_run(tp, side, atr_now, pct=0.15):
+    return (tp - pct*atr_now) if side=="LONG" else (tp + pct*atr_now)
+
+# ================== Sinyal Üretimi (KESKİN HEDEF) ==================
 def build_signal(df, tf, sym):
     df = df.copy()
     df["ema_fast"] = ema(df["close"], EMA_FAST)
@@ -261,13 +311,36 @@ def build_signal(df, tf, sym):
     slope_b = float(slope(df["ema_base"], 15))
     r_now = float(df["rsi"].iloc[-1])
     atr_now = float(df["atr"].iloc[-1])
-
     slope_min = SLOPE_MIN_BY_TF.get(tf, DEFAULT_SLOPE_MIN)
+
+    # HTF EMA200 mesafesi (scalp için 1h kullan)
+    try:
+        htf = "1h" if tf in ("5m","15m") else "4h"
+        df_htf = get_klines(sym, htf, limit=210)
+        ema200_htf = float(ema(df_htf["close"], 200).iloc[-1])
+        if abs(c - ema200_htf) <= 0.3 * atr_now:
+            if PRINT_REASONS: print(f"[REJECT] {sym} {tf} HTF-EMA200 duvarı yakın")
+            return []
+    except Exception:
+        pass  # HTF alınamazsa devam
+
+    # ADX (trend gücü)
+    try:
+        adxv = adx14(df)
+        if adxv < 18:
+            if PRINT_REASONS: print(f"[REJECT] {sym} {tf} ADX14 zayıf {adxv:.1f}")
+            return []
+    except Exception:
+        adxv = 20.0  # emniyet
 
     long_trend  = (c > base_val) and (slope_b >=  slope_min)
     short_trend = (c < base_val) and (slope_b <= -slope_min)
 
+    up_lvl, lo_lvl = donchian_prev(df, n=20)
+    swingH, swingL = recent_swing_levels(df, lookback=20)
+
     out = []
+
     def push(side, entry, tp, sl, reason_ok):
         rr = (tp-entry)/max((entry-sl),1e-9) if side=="LONG" else (entry-tp)/max((sl-entry),1e-9)
         conf = confidence_score(rr, abs(slope_b), r_now, tf)
@@ -279,7 +352,6 @@ def build_signal(df, tf, sym):
             out.append({
                 "sym":sym,"tf":tf,"side":side,"entry":entry,"tp":tp,"sl":sl,
                 "rr":rr,"conf":conf,"lev": lev,
-                # >>> (YENİ) ATR+TF bazlı süre:
                 "est_min": estimate_minutes(entry, tp, atr_now, tf),
                 "slope_b":slope_b,"slope_min":slope_min
             })
@@ -288,27 +360,56 @@ def build_signal(df, tf, sym):
             if PRINT_REASONS:
                 print(f"[INFO] Yakın sinyal: {sym} {tf} rr={rr:.2f} conf={conf} slope={slope_b:.3f}/{slope_min:.3f}")
 
-    if long_trend and r_now >= 42:
-        push("LONG", c, c+atr_now*ATR_MULT_TP, c-atr_now*ATR_MULT_SL,
-             f"slope {slope_b:.3f}>=min {slope_min:.3f} rsi {r_now:.1f}")
-    else:
-        if PRINT_REASONS:
-            print(f"[REJECT] {sym} {tf} LONG trend yok | slope {slope_b:.3f}/min {slope_min:.3f} rsi {r_now:.1f}")
+    # === LONG: kırılım + retest (1–3 mum), entry = çizgi üstü hafif tampon
+    # son kapanış up_lvl üstünde MI? (fake breakoutları eleyelim)
+    if long_trend and r_now >= 42 and c > up_lvl:
+        tol = 0.15 * atr_now
+        # son 3 mumda retest: low <= up_lvl + tol
+        if (df["low"].tail(3) <= (up_lvl + tol)).any():
+            entry = up_lvl + 0.02 * atr_now   # slippage tamponu
+            tp_atr  = entry + 1.8 * atr_now
+            tp_strc = (swingH * 0.90) if swingH > entry else (entry + 1.8*atr_now)
+            tp_raw  = min(tp_atr, tp_strc)
+            tp = front_run(tp_raw, "LONG", atr_now, pct=0.15)
 
-    if short_trend and r_now <= 58:
-        push("SHORT", c, c-atr_now*ATR_MULT_TP, c+atr_now*ATR_MULT_SL,
-             f"slope {slope_b:.3f}<=-min {-slope_min:.3f} rsi {r_now:.1f}")
+            sl_struct = swingL - 0.2 * atr_now
+            sl_atr    = entry - 1.0 * atr_now
+            sl = min(sl_struct, sl_atr)
+
+            if entry > sl and tp > entry:
+                push("LONG", entry, tp, sl, f"retest up {up_lvl:.6f} tol={tol:.6f}")
+
     else:
         if PRINT_REASONS:
-            print(f"[REJECT] {sym} {tf} SHORT trend yok | slope {slope_b:.3f}/-min {-slope_min:.3f} rsi {r_now:.1f}")
+            print(f"[REJECT] {sym} {tf} LONG yok | slope {slope_b:.3f}/min {slope_min:.3f} rsi {r_now:.1f} c<=up {c<=up_lvl}")
+
+    # === SHORT: kırılım + retest (1–3 mum), entry = çizgi altı hafif tampon
+    if short_trend and r_now <= 58 and c < lo_lvl:
+        tol = 0.15 * atr_now
+        if (df["high"].tail(3) >= (lo_lvl - tol)).any():
+            entry = lo_lvl - 0.02 * atr_now
+            tp_atr  = entry - 1.8 * atr_now
+            tp_strc = (swingL * 1.10) if swingL < entry else (entry - 1.8*atr_now)
+            tp_raw  = max(tp_atr, tp_strc)
+            tp = front_run(tp_raw, "SHORT", atr_now, pct=0.15)
+
+            sl_struct = swingH + 0.2 * atr_now
+            sl_atr    = entry + 1.0 * atr_now
+            sl = max(sl_struct, sl_atr)
+
+            if entry < sl and tp < entry:
+                push("SHORT", entry, tp, sl, f"retest lo {lo_lvl:.6f} tol={tol:.6f}")
+    else:
+        if PRINT_REASONS:
+            print(f"[REJECT] {sym} {tf} SHORT yok | slope {slope_b:.3f}/-min {-slope_min:.3f} rsi {r_now:.1f} c>=lo {c>=lo_lvl}")
 
     return out
 
 # ================== Cooldown ==================
 _last_sent = {}
 _last_side_sent = {}
-COOLDOWN_BY_TF_MIN = {"5m": 90, "15m": 150, "1h": 300, "4h": 360}
-GLOBAL_SIDE_COOLDOWN_MIN = 150
+COOLDOWN_BY_TF_MIN = {"5m": 75, "15m": 120, "1h": 300, "4h": 360}
+GLOBAL_SIDE_COOLDOWN_MIN = 120
 
 def cooldown_ok(sym, tf, side):
     now = time.time()
@@ -389,7 +490,7 @@ def maybe_stats():
 
 def main():
     global _last_heartbeat_ts, _last_stats_ts
-    print("[BOOT] scanner VERSION: geo-rot+fallback")
+    print("[BOOT] scanner VERSION: sharp-targets+geo-rot")
     send_tg("🟢 KriptoAlper başladı.")
     _last_heartbeat_ts = time.time()
     _last_stats_ts = time.time()
@@ -408,4 +509,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
