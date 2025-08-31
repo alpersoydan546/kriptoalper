@@ -1,4 +1,4 @@
-# ============================ KriptoAlper — SCANNER (15 Coin • ConfBadge • Dynamic Leverage • Sharp Targets) ============================
+# ============================ KriptoAlper — SCANNER (15 Coin • ConfBadge • Dynamic Leverage • Sharp Targets • ADX Fix) ============================
 # Gereksinimler: requests, pandas, numpy, python-dotenv
 # ENV (zorunlu): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # ENV (opsiyonel):
@@ -271,23 +271,40 @@ def get_klines(symbol, interval="5m", limit=210):
             tries += 1
     raise RuntimeError("klines failed") from last_err
 
-# ================== Keskin Hedef Yardımcıları (YENİ) ==================
+# ================== Keskin Hedef Yardımcıları ==================
 def recent_swing_levels(df, lookback=20):
     h = float(df["high"].tail(lookback).max())
     l = float(df["low"].tail(lookback).min())
     return h, l
 
-def adx14(df):
-    up = df["high"].diff()
-    dn = -df["low"].diff()
-    plusDM  = np.where((up > dn) & (up > 0), up, 0.0)
-    minusDM = np.where((dn > up) & (dn > 0), -dn, 0.0)
-    tr = np.maximum(df["high"] - df["low"], np.maximum(abs(df["high"] - df["close"].shift()), abs(df["low"] - df["close"].shift())))
-    atr_ = pd.Series(tr).ewm(alpha=1/14, adjust=False).mean()
-    pdi = 100 * pd.Series(plusDM).ewm(alpha=1/14, adjust=False).mean() / (atr_ + 1e-9)
-    mdi = 100 * pd.Series(minusDM).ewm(alpha=1/14, adjust=False).mean() / (atr_ + 1e-9)
-    dx = (100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)).fillna(0)
-    return float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+# ---- FIXED ADX ----
+def adx14(df, n: int = 14) -> float:
+    """
+    Wilder ADX (pozitif ve stabil). +DM / -DM işaret hatası giderildi.
+    """
+    high = df["high"].astype(float)
+    low  = df["low"].astype(float)
+    close= df["close"].astype(float)
+
+    up_move   = high.diff()
+    down_move = (-low.diff())  # low düşüşü pozitif olsun
+
+    plusDM  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minusDM = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = np.maximum(high - low,
+         np.maximum((high - close.shift()).abs(), (low - close.shift()).abs()))
+    atr_ = pd.Series(tr).ewm(alpha=1/n, adjust=False).mean()
+
+    plusDI  = 100 * pd.Series(plusDM).ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-9)
+    minusDI = 100 * pd.Series(minusDM).ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-9)
+
+    dx = (100 * (plusDI - minusDI).abs() / (plusDI + minusDI + 1e-9)).fillna(0.0)
+    adx = dx.ewm(alpha=1/n, adjust=False).mean()
+
+    val = float(adx.iloc[-1])
+    if not np.isfinite(val): val = 0.0
+    return max(0.0, min(100.0, val))
 
 def donchian_prev(df, n=20):
     up = df["high"].rolling(n).max().iloc[-2]
@@ -324,10 +341,10 @@ def build_signal(df, tf, sym):
     except Exception:
         pass  # HTF alınamazsa devam
 
-    # ADX (trend gücü)
+    # ADX (trend gücü) — eşik 18 → 15
     try:
         adxv = adx14(df)
-        if adxv < 18:
+        if adxv < 15:
             if PRINT_REASONS: print(f"[REJECT] {sym} {tf} ADX14 zayıf {adxv:.1f}")
             return []
     except Exception:
@@ -361,12 +378,10 @@ def build_signal(df, tf, sym):
                 print(f"[INFO] Yakın sinyal: {sym} {tf} rr={rr:.2f} conf={conf} slope={slope_b:.3f}/{slope_min:.3f}")
 
     # === LONG: kırılım + retest (1–3 mum), entry = çizgi üstü hafif tampon
-    # son kapanış up_lvl üstünde MI? (fake breakoutları eleyelim)
     if long_trend and r_now >= 42 and c > up_lvl:
         tol = 0.15 * atr_now
-        # son 3 mumda retest: low <= up_lvl + tol
         if (df["low"].tail(3) <= (up_lvl + tol)).any():
-            entry = up_lvl + 0.02 * atr_now   # slippage tamponu
+            entry = up_lvl + 0.02 * atr_now
             tp_atr  = entry + 1.8 * atr_now
             tp_strc = (swingH * 0.90) if swingH > entry else (entry + 1.8*atr_now)
             tp_raw  = min(tp_atr, tp_strc)
@@ -378,7 +393,6 @@ def build_signal(df, tf, sym):
 
             if entry > sl and tp > entry:
                 push("LONG", entry, tp, sl, f"retest up {up_lvl:.6f} tol={tol:.6f}")
-
     else:
         if PRINT_REASONS:
             print(f"[REJECT] {sym} {tf} LONG yok | slope {slope_b:.3f}/min {slope_min:.3f} rsi {r_now:.1f} c<=up {c<=up_lvl}")
@@ -490,7 +504,7 @@ def maybe_stats():
 
 def main():
     global _last_heartbeat_ts, _last_stats_ts
-    print("[BOOT] scanner VERSION: sharp-targets+geo-rot")
+    print("[BOOT] scanner VERSION: sharp-targets+geo-rot+adxfix")
     send_tg("🟢 KriptoAlper başladı.")
     _last_heartbeat_ts = time.time()
     _last_stats_ts = time.time()
