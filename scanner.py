@@ -1,17 +1,11 @@
-# ============================ KriptoAlper — SCANNER (15 Coin • ConfBadge • Dynamic Leverage • Sharp Targets • ADX Fix) ============================
-# Gereksinimler: requests, pandas, numpy, python-dotenv
-# ENV (zorunlu): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (opsiyonel):
-#   GEO_FORCE_POOL=spot|vision|fapi   (varsayılan: spot; 451 gelirse otomatik vision→fapi fallback)
-#   USE_FAPI_FALLBACK=1               (451/418 geldiğinde futures'a düş)
-#   KLINES_CACHE_TTL=25               (sn)
-#   REQ_SLEEP_SEC=0.22                (istek arası taban gecikme)
-#   MAX_TRIES_PER_CALL=5
-#   FAPI_BASE=https://<worker_or_proxy_domain>  # VARSA: sadece bu host üzerinden FAPI (Cloudflare Worker vb.)
-# Not: Auto-trade YOK; sadece sinyal gönderir.
+# scanner_highfreq_reliable.py
+# "Frequent but reliable" scanner for Binance (spot-first, no auto-trade)
+# Requirements: requests, pandas, numpy, python-dotenv
+# ENV required: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+# Optional ENV: GEO_FORCE_POOL (spot|vision|fapi), USE_FAPI_FALLBACK=1, REQ_SLEEP_SEC, KLINES_CACHE_TTL, TOP_SIGNALS_PER_CYCLE
 
 import os, time, traceback, random, math
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 
 import numpy as np
 import pandas as pd
@@ -19,69 +13,85 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-BOT_NAME = "KriptoAlper"
 
-# ================== DEBUG / TELEGRAM / HEARTBEAT ==================
+# ---------- CONFIG ----------
+BOT_NAME = "KriptoAlper"
 DEBUG = True
-PRINT_REASONS = True
 SEND_TO_TELEGRAM = True
 
-HEARTBEAT_EVERY_MIN = 15
-SILENCE_ALERT_MIN = 120
-STATS_EVERY_HR = 12
+REQ_SLEEP_SEC = float(os.getenv("REQ_SLEEP_SEC", "0.18"))   # istek arası baz gecikme
+CACHE_TTL = int(os.getenv("KLINES_CACHE_TTL", "12"))      # kısa cache -> sık tarama
+TOP_SIGNALS_PER_CYCLE = int(os.getenv("TOP_SIGNALS_PER_CYCLE", "6"))  # her döngüde atılacak max sinyal
 
-_last_heartbeat_ts = 0.0
-_last_stats_ts = 0.0
-_last_signal_ts = None
-_scanned_counter = 0
+# timeframes to check (fast scanning)
+TFs = ["1m","3m","5m","15m"]   # sık tarama için kısa TFlar (aynı zamanda 15m ile biraz daha güven)
+TF_PRIORITY = {"1m":0,"3m":1,"5m":2,"15m":3}
 
-perf_sent_total = 0
-perf_sent_by_sym = defaultdict(int)
-perf_rr_last = deque(maxlen=300)
+# coin list (başlangıç: favori 15); istersen burayı 50/100 ile genişlet
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+         "ADAUSDT","AVAXUSDT","LINKUSDT","DOGEUSDT","TRXUSDT",
+         "MATICUSDT","DOTUSDT","ARBUSDT","OPUSDT","RNDRUSDT"]
 
-# ================== TELEGRAM ==================
+# indicators params
+EMA_FAST = 8
+EMA_SLOW = 21
+EMA_BASE = 200
+RSI_LEN = 14
+ATR_LEN = 14
+MIN_CONF_SEND = 70   # final gönderim için avg score >= bu değer
+
+# confluence requirements
+MIN_TF_CONFLUENCE = 2       # en az kaç farklı TF aynı yönü desteklemeli
+VOLUME_SPIKE_MULT = 1.35    # hacim spike eşiği
+MIN_AVG_RR = 1.10           # minimum avg RR (konservatif)
+
+# cooldown per symbol to avoid spam (kısa)
+SYM_COOLDOWN_SEC = 30 * 60   # aynı sembol için minimal bekleme (30 dk)
+GLOBAL_SEND_LIMIT_PER_CYCLE = TOP_SIGNALS_PER_CYCLE
+
+# network / endpoints (spot-first)
+SPOT_HOSTS = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api4.binance.com","https://api-gcp.binance.com","https://data-api.binance.vision"]
+FAPI_HOSTS = ["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
+POOL_CURSOR = {"spot":0, "fapi":0}
+GEO_FORCE_POOL = os.getenv("GEO_FORCE_POOL","spot").lower()
+USE_FAPI_FALLBACK = os.getenv("USE_FAPI_FALLBACK","1") == "1"
+MAX_TRIES = int(os.getenv("MAX_TRIES_PER_CALL","4"))
+
+# session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept":"application/json,text/plain,*/*"
 })
 
+# ---------- TELEGRAM ----------
 def send_tg(text):
-    if not SEND_TO_TELEGRAM:
-        print("[DRY-RUN]", text.replace("\n"," ")[:280]); return
-    token = os.getenv("TELEGRAM_TOKEN","")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID","")
+    token = os.getenv("TELEGRAM_TOKEN","").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID","").strip()
     if not token or not chat_id:
-        print("Telegram yapılandırılmamış."); return
+        print("[TG] TELEGRAM_TOKEN or CHAT_ID not set"); return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        r = SESSION.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
-        print("[TG SEND]", r.status_code, r.text[:120])
-    except Exception as e:
-        print("[TG ERROR]", repr(e))
+    payload = {"chat_id": chat_id, "text": text}
+    tries = 0
+    while tries < 3:
+        try:
+            r = SESSION.post(url, json=payload, timeout=8)
+            ct = r.headers.get("Content-Type","")
+            body = r.text if "json" not in ct else r.json()
+            print(f"[TG SEND] code={r.status_code} body={str(body)[:200]}")
+            if r.status_code == 200:
+                return
+            if r.status_code in (400,401,403,404):
+                print("[TG FATAL] token/chat_id/permission issue"); return
+            time.sleep(0.9 + tries*0.6)
+        except Exception as e:
+            print("[TG EXC]", repr(e))
+            time.sleep(1 + tries*0.6)
+        tries += 1
 
-def _fmt_price(x: float) -> str:
-    if x >= 1:   return f"{x:,.3f}".replace(","," ")
-    return f"{x:.6f}".rstrip("0").rstrip(".")
-
-# ================== Coin Listesi (15 güçlü coin) ==================
-COINS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "ADAUSDT","AVAXUSDT","LINKUSDT","DOGEUSDT","TRXUSDT",
-    "MATICUSDT","DOTUSDT","ARBUSDT","OPUSDT","RNDRUSDT"
-]
-
-# === TF’ler: 5m + 15m (scalp) ve 1h + 4h (swing) ===
-TIMEFRAMES_SCALP = ["5m","15m"]
-TIMEFRAMES_SWING = ["1h","4h"]
-SCALP_TFS = set(TIMEFRAMES_SCALP)
-
-# ================== Göstergeler ==================
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+# ---------- UTIL indicators ----------
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
 
 def rsi(series, n=14):
     ch = series.diff()
@@ -97,7 +107,7 @@ def atr(df, n=14):
     tr = pd.concat([hl,hc,lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
-def slope(series, length=15):
+def slope(series, length=12):
     if len(series) < length+1: return 0.0
     y = series.iloc[-length:].values
     x = np.arange(length)
@@ -105,421 +115,247 @@ def slope(series, length=15):
     base = np.mean(np.abs(y)) + 1e-9
     return (m / base) * 100
 
-# ================== Sinyal Mantığı (A Modu ufak gevşetme) ==================
-EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
-RSI_LEN = 14
-ATR_LEN = 14
+# ---------- network: klines with pool & cache ----------
+_kl_cache = {}
 
-MIN_RR_SCALP, MIN_RR_SWING = 1.25, 1.70
-MIN_CONF_SCALP, MIN_CONF_SWING = 55, 75
-SLOPE_MIN_BY_TF = {"5m": 0.008, "15m": 0.008, "1h": 0.011, "4h": 0.014}
-DEFAULT_SLOPE_MIN = 0.008
-
-# SL/TP temel çarpanları (Keskin hedef mantığında hibritleşiyor)
-ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.0
-
-# Telegram gönderim alt eşiği
-MIN_SEND_CONF = 55
-
-def confidence_score(rr, slope_abs, rsi_now, tf):
-    base = 50
-    base += min(15, max(0.0, (rr-1.2)*10))
-    base += max(0, min(10, slope_abs/0.05))
-    if 45 <= rsi_now <= 62: base += 3
-    if tf in SCALP_TFS: base += 2
-    return int(max(0, min(100, round(base))))
-
-# ====== Trafik ışığı ve Dinamik Kaldıraç ======
-def conf_badge(conf:int) -> str:
-    if conf >= 85: return "🟢"
-    if conf >= 75: return "🟡"
-    return "🔴"
-
-def choose_leverage(conf:int, tf:str) -> int | None:
-    if conf < 75: return None
-    if conf < 85: return 12 if tf in SCALP_TFS else 10
-    if conf < 90: return 18 if tf in SCALP_TFS else 12
-    return 25 if tf in SCALP_TFS else 15
-
-# ================== Mesaj Formatı ==================
-def fmt_signal_card(parite, tf, yon, price, tp, sl, rr, conf, slope_val, slope_min, lev, est_min):
-    badge = conf_badge(conf)
-    header = f"{'📈' if yon=='LONG' else '📉'} {parite} {tf} {yon} {badge}"
-    conf_line = f"🧠 Güven: {conf}/100 {badge}"
-    if lev is None:
-        lev_line = f"⚠️ Güven düşük (kaldıraç yok)"
-    else:
-        lev_line = f"⚡ Kaldıraç: {lev}x"
-    return (
-        f"{header}\n"
-        f"💵 Giriş: {_fmt_price(price)}\n"
-        f"🎯 TP: {_fmt_price(tp)}\n"
-        f"🛑 SL: {_fmt_price(sl)}\n"
-        f"⚖️ R:R {rr:.2f}\n"
-        f"{conf_line}\n"
-        f"📐 Slope {slope_val:.3f} / min {slope_min:.3f}\n"
-        f"{lev_line} | ⏳ ~{est_min} dk"
-    )
-
-# ================== (YENİ) Gerçekçi Süre Tahmini ==================
-TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
-
-def estimate_minutes(entry: float, tp: float, atr_now: float, tf: str) -> int:
-    dist = abs(tp - entry)
-    bars = max(1.0, dist / max(atr_now, 1e-9))
-    return int(math.ceil(bars * TF_MINUTES.get(tf, 5)))
-
-# ================== Ağ Katmanı (Anti 451/429/302) ==================
-SPOT_HOSTS  = [
-    "https://api.binance.com","https://api1.binance.com","https://api2.binance.com",
-    "https://api3.binance.com","https://api4.binance.com","https://api-gcp.binance.com",
-    "https://data-api.binance.vision","https://api.binance.vision"
-]
-FAPI_BASE = os.getenv("FAPI_BASE","").strip()
-if FAPI_BASE:
-    FAPI_HOSTS = [FAPI_BASE.rstrip("/")]
-else:
-    FAPI_HOSTS  = ["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
-
-POOL_CURSOR = {"spot":0, "fapi":0}
-GEO_FORCE_POOL = os.getenv("GEO_FORCE_POOL","spot").lower()
-USE_FAPI_FALLBACK = os.getenv("USE_FAPI_FALLBACK","1") == "1"
-REQ_SLEEP_SEC = float(os.getenv("REQ_SLEEP_SEC","0.22"))
-MAX_TRIES_PER_CALL = int(os.getenv("MAX_TRIES_PER_CALL","5"))
-CACHE_TTL = int(os.getenv("KLINES_CACHE_TTL","25"))
-
-_kl_cache = {}  # (sym,tf) -> (ts, df)
-
-def _pick_host(pool: str) -> str:
+def _pick_host(pool):
     hosts = SPOT_HOSTS if pool=="spot" else FAPI_HOSTS
     i = POOL_CURSOR[pool] % len(hosts)
     POOL_CURSOR[pool] += 1
     return hosts[i]
 
-def _make_url(pool: str, host: str, symbol: str, interval: str) -> str:
-    if pool == "fapi":
-        return f"{host}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=210"
-    return f"{host}/api/v3/klines?symbol={symbol}&interval={interval}&limit=210"
+def _make_url(pool, host, symbol, interval):
+    if pool=="fapi":
+        return f"{host}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=240"
+    return f"{host}/api/v3/klines?symbol={symbol}&interval={interval}&limit=240"
 
-def get_klines(symbol, interval="5m", limit=210):
-    # ---- cache
+def get_klines(symbol, interval="5m"):
     key = (symbol, interval)
     now = time.time()
     hit = _kl_cache.get(key)
     if hit and (now - hit[0]) <= CACHE_TTL:
-        if DEBUG: print(f"[CACHE] {symbol} {interval} hit")
         return hit[1].copy()
-
-    # havuz planı
-    force = GEO_FORCE_POOL
-    if force in ("vision","spot"):
-        pools_try = ["spot","fapi"] if USE_FAPI_FALLBACK else ["spot"]
-    elif force == "fapi":
-        pools_try = ["fapi"]
+    pools = []
+    if GEO_FORCE_POOL in ("spot","vision"):
+        pools = ["spot","fapi"] if USE_FAPI_FALLBACK else ["spot"]
+    elif GEO_FORCE_POOL=="fapi":
+        pools = ["fapi"]
     else:
-        pools_try = ["spot","fapi"]
-
+        pools = ["spot","fapi"]
     last_err = None
-    for pool in pools_try:
+    for pool in pools:
         tries = 0
-        while tries < MAX_TRIES_PER_CALL:
+        while tries < MAX_TRIES:
             host = _pick_host(pool)
             url = _make_url(pool, host, symbol, interval)
             try:
-                if DEBUG: print(f"[RATE/GEO] {symbol} {interval} via {host.split('//')[1]} ...", end="")
                 headers = {}
-                if pool == "fapi":
+                if pool=="fapi":
                     headers = {"Origin":"https://www.binance.com","Referer":"https://www.binance.com/en/futures"}
-                r = SESSION.get(url, timeout=12, allow_redirects=False, headers=headers or None)
+                r = SESSION.get(url, timeout=10, allow_redirects=False, headers=headers or None)
                 code = r.status_code
-
                 if code in (301,302,303,307,308):
-                    if DEBUG: print(f" {code} (redir)")
-                    time.sleep(REQ_SLEEP_SEC*1.2); tries += 1; continue
-
+                    tries += 1; time.sleep(REQ_SLEEP_SEC); continue
                 if code == 200:
-                    ct = (r.headers.get("Content-Type","").lower())
+                    ct = r.headers.get("Content-Type","").lower()
                     if "json" not in ct:
-                        if DEBUG: print(" non-json")
-                        time.sleep(REQ_SLEEP_SEC); tries += 1; continue
+                        tries += 1; time.sleep(REQ_SLEEP_SEC); continue
                     arr = r.json()
                     cols = ["open_time","open","high","low","close","volume","ct","qv","trades","tb","tq","ig"]
                     df = pd.DataFrame(arr, columns=cols)
                     for c in ["open","high","low","close","volume"]:
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     _kl_cache[key] = (now, df)
-                    if DEBUG: print(" 200")
                     time.sleep(REQ_SLEEP_SEC + random.random()*0.05)
                     return df.copy()
-
-                elif code in (429, 418):
-                    if DEBUG: print(f" {code} (rate)")
-                    time.sleep(REQ_SLEEP_SEC*1.6 + tries*0.2)
-
-                elif code in (451, 403):
-                    if DEBUG: print(f" {code} (geo)")
-                    time.sleep(REQ_SLEEP_SEC*1.2)
-
                 else:
-                    if DEBUG: print(f" {code}")
+                    tries += 1
                     time.sleep(REQ_SLEEP_SEC)
-
             except Exception as e:
                 last_err = e
-                if DEBUG: print(f" EXC {type(e).__name__}")
+                tries += 1
                 time.sleep(REQ_SLEEP_SEC)
-            tries += 1
     raise RuntimeError("klines failed") from last_err
 
-# ================== Keskin Hedef Yardımcıları ==================
-def recent_swing_levels(df, lookback=20):
-    h = float(df["high"].tail(lookback).max())
-    l = float(df["low"].tail(lookback).min())
-    return h, l
+# ---------- signal math: per-TF micro-signal ----------
+def analyze_tf(df, tf):
+    # df assumed to be klines for that tf
+    res = {}
+    close = df["close"]
+    vol = df["volume"]
+    ema_fast = ema(close, EMA_FAST).iloc[-1]
+    ema_slow = ema(close, EMA_SLOW).iloc[-1]
+    ema_base = ema(close, EMA_BASE).iloc[-1]
+    rsi_now = float(rsi(close, RSI_LEN).iloc[-1])
+    atr_now = float(atr(df, ATR_LEN).iloc[-1])
+    slope_val = float(slope(ema(close, EMA_BASE), length=12))
 
-# ---- FIXED ADX ----
-def adx14(df, n: int = 14) -> float:
-    """
-    Wilder ADX (pozitif ve stabil). +DM / -DM işaret hatası giderildi.
-    """
-    high = df["high"].astype(float)
-    low  = df["low"].astype(float)
-    close= df["close"].astype(float)
+    c = float(close.iloc[-1])
+    last_vol = float(vol.iloc[-1])
+    vol_avg = float(vol.tail(50).mean() if len(vol)>=50 else vol.mean())
 
-    up_move   = high.diff()
-    down_move = (-low.diff())  # low düşüşü pozitif olsun
+    # simple direction signals
+    long_ok = (c > ema_base) and (ema_fast > ema_slow) and (slope_val > 0)
+    short_ok = (c < ema_base) and (ema_fast < ema_slow) and (slope_val < 0)
 
-    plusDM  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minusDM = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    # volume spike
+    vol_spike = last_vol >= max(1e-9, vol_avg * VOLUME_SPIKE_MULT)
 
-    tr = np.maximum(high - low,
-         np.maximum((high - close.shift()).abs(), (low - close.shift()).abs()))
-    atr_ = pd.Series(tr).ewm(alpha=1/n, adjust=False).mean()
-
-    plusDI  = 100 * pd.Series(plusDM).ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-9)
-    minusDI = 100 * pd.Series(minusDM).ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-9)
-
-    dx = (100 * (plusDI - minusDI).abs() / (plusDI + minusDI + 1e-9)).fillna(0.0)
-    adx = dx.ewm(alpha=1/n, adjust=False).mean()
-
-    val = float(adx.iloc[-1])
-    if not np.isfinite(val): val = 0.0
-    return max(0.0, min(100.0, val))
-
-def donchian_prev(df, n=20):
-    up = df["high"].rolling(n).max().iloc[-2]
-    lo = df["low"].rolling(n).min().iloc[-2]
-    return float(up), float(lo)
-
-def front_run(tp, side, atr_now, pct=0.15):
-    return (tp - pct*atr_now) if side=="LONG" else (tp + pct*atr_now)
-
-# ================== Sinyal Üretimi (KESKİN HEDEF) ==================
-def build_signal(df, tf, sym):
-    df = df.copy()
-    df["ema_fast"] = ema(df["close"], EMA_FAST)
-    df["ema_slow"] = ema(df["close"], EMA_SLOW)
-    df["ema_base"] = ema(df["close"], EMA_BASE)
-    df["rsi"] = rsi(df["close"], RSI_LEN)
-    df["atr"] = atr(df, ATR_LEN)
-
-    c = float(df["close"].iloc[-1])
-    base_val = float(df["ema_base"].iloc[-1])
-    slope_b = float(slope(df["ema_base"], 15))
-    r_now = float(df["rsi"].iloc[-1])
-    atr_now = float(df["atr"].iloc[-1])
-    slope_min = SLOPE_MIN_BY_TF.get(tf, DEFAULT_SLOPE_MIN)
-
-    # HTF EMA200 mesafesi (scalp için 1h kullan)
-    try:
-        htf = "1h" if tf in ("5m","15m") else "4h"
-        df_htf = get_klines(sym, htf, limit=210)
-        ema200_htf = float(ema(df_htf["close"], 200).iloc[-1])
-        if abs(c - ema200_htf) <= 0.3 * atr_now:
-            if PRINT_REASONS: print(f"[REJECT] {sym} {tf} HTF-EMA200 duvarı yakın")
-            return []
-    except Exception:
-        pass  # HTF alınamazsa devam
-
-    # ADX (trend gücü) — eşik 18 → 15
-    try:
-        adxv = adx14(df)
-        if adxv < 15:
-            if PRINT_REASONS: print(f"[REJECT] {sym} {tf} ADX14 zayıf {adxv:.1f}")
-            return []
-    except Exception:
-        adxv = 20.0  # emniyet
-
-    long_trend  = (c > base_val) and (slope_b >=  slope_min)
-    short_trend = (c < base_val) and (slope_b <= -slope_min)
-
-    up_lvl, lo_lvl = donchian_prev(df, n=20)
-    swingH, swingL = recent_swing_levels(df, lookback=20)
-
-    out = []
-
-    def push(side, entry, tp, sl, reason_ok):
-        rr = (tp-entry)/max((entry-sl),1e-9) if side=="LONG" else (entry-tp)/max((sl-entry),1e-9)
-        conf = confidence_score(rr, abs(slope_b), r_now, tf)
-        rr_min   = MIN_RR_SCALP if tf in SCALP_TFS else MIN_RR_SWING
-        conf_min = MIN_CONF_SCALP if tf in SCALP_TFS else MIN_CONF_SWING
-
-        if rr >= rr_min and conf >= conf_min:
-            lev = choose_leverage(conf, tf)
-            out.append({
-                "sym":sym,"tf":tf,"side":side,"entry":entry,"tp":tp,"sl":sl,
-                "rr":rr,"conf":conf,"lev": lev,
-                "est_min": estimate_minutes(entry, tp, atr_now, tf),
-                "slope_b":slope_b,"slope_min":slope_min
-            })
-            if DEBUG: print(f"[SCAN] {sym} {tf} {side} rr={rr:.2f} conf={conf} lev={lev} {reason_ok}")
-        else:
-            if PRINT_REASONS:
-                print(f"[INFO] Yakın sinyal: {sym} {tf} rr={rr:.2f} conf={conf} slope={slope_b:.3f}/{slope_min:.3f}")
-
-    # === LONG: kırılım + retest (1–3 mum), entry = çizgi üstü hafif tampon
-    if long_trend and r_now >= 42 and c > up_lvl:
-        tol = 0.15 * atr_now
-        if (df["low"].tail(3) <= (up_lvl + tol)).any():
-            entry = up_lvl + 0.02 * atr_now
-            tp_atr  = entry + 1.8 * atr_now
-            tp_strc = (swingH * 0.90) if swingH > entry else (entry + 1.8*atr_now)
-            tp_raw  = min(tp_atr, tp_strc)
-            tp = front_run(tp_raw, "LONG", atr_now, pct=0.15)
-
-            sl_struct = swingL - 0.2 * atr_now
-            sl_atr    = entry - 1.0 * atr_now
-            sl = min(sl_struct, sl_atr)
-
-            if entry > sl and tp > entry:
-                push("LONG", entry, tp, sl, f"retest up {up_lvl:.6f} tol={tol:.6f}")
+    # TP/SL rough
+    if long_ok:
+        entry = c
+        tp = c + 1.5 * atr_now
+        sl = c - 1.0 * atr_now
+    elif short_ok:
+        entry = c
+        tp = c - 1.5 * atr_now
+        sl = c + 1.0 * atr_now
     else:
-        if PRINT_REASONS:
-            print(f"[REJECT] {sym} {tf} LONG yok | slope {slope_b:.3f}/min {slope_min:.3f} rsi {r_now:.1f} c<=up {c<=up_lvl}")
+        entry,tp,sl = c,c,c
 
-    # === SHORT: kırılım + retest (1–3 mum), entry = çizgi altı hafif tampon
-    if short_trend and r_now <= 58 and c < lo_lvl:
-        tol = 0.15 * atr_now
-        if (df["high"].tail(3) >= (lo_lvl - tol)).any():
-            entry = lo_lvl - 0.02 * atr_now
-            tp_atr  = entry - 1.8 * atr_now
-            tp_strc = (swingL * 1.10) if swingL < entry else (entry - 1.8*atr_now)
-            tp_raw  = max(tp_atr, tp_strc)
-            tp = front_run(tp_raw, "SHORT", atr_now, pct=0.15)
+    # compute a micro score (0-100)
+    score = 50
+    if long_ok or short_ok:
+        score += 10
+    if vol_spike: score += 14
+    # rsi neutral bias
+    if 40 <= rsi_now <= 60: score += 6
+    # slope magnitude
+    score += min(20, abs(slope_val)*40)
+    # rr
+    rr = abs((tp-entry) / max(1e-9, (entry-sl)))
+    score += min(20, max(-10, (rr-1.0)*12))
 
-            sl_struct = swingH + 0.2 * atr_now
-            sl_atr    = entry + 1.0 * atr_now
-            sl = max(sl_struct, sl_atr)
+    score = int(max(0, min(100, round(score))))
 
-            if entry < sl and tp < entry:
-                push("SHORT", entry, tp, sl, f"retest lo {lo_lvl:.6f} tol={tol:.6f}")
-    else:
-        if PRINT_REASONS:
-            print(f"[REJECT] {sym} {tf} SHORT yok | slope {slope_b:.3f}/-min {-slope_min:.3f} rsi {r_now:.1f} c>=lo {c>=lo_lvl}")
+    res.update({
+        "tf": tf,
+        "entry": entry, "tp": tp, "sl": sl, "rr": rr,
+        "score": score, "side": "LONG" if long_ok and not short_ok else ("SHORT" if short_ok and not long_ok else None),
+        "vol_spike": vol_spike, "rsi": rsi_now, "slope": slope_val
+    })
+    return res
 
-    return out
+# ---------- aggregate across TFs to produce candidate signals ----------
+_last_sent_ts = {}  # (sym) -> ts
 
-# ================== Cooldown ==================
-_last_sent = {}
-_last_side_sent = {}
-COOLDOWN_BY_TF_MIN = {"5m": 75, "15m": 120, "1h": 300, "4h": 360}
-GLOBAL_SIDE_COOLDOWN_MIN = 120
+def aggregate_signals(sym):
+    # collect per-TF analysis
+    analyses = {}
+    for tf in TFs:
+        try:
+            df = get_klines(sym, tf)
+            analyses[tf] = analyze_tf(df, tf)
+        except Exception as e:
+            if DEBUG: print(f"[AGG] {sym} {tf} fail {e}")
+            continue
 
-def cooldown_ok(sym, tf, side):
-    now = time.time()
-    cd_tf = COOLDOWN_BY_TF_MIN.get(tf,180)*60
-    if (now - _last_sent.get((sym, tf, side), 0)) <= cd_tf:
-        if PRINT_REASONS: print(f"[COOLDOWN] {sym} {tf} {side} tf_cd")
-        return False
-    cd_global = GLOBAL_SIDE_COOLDOWN_MIN*60
-    if (now - _last_side_sent.get((sym, side), 0)) <= cd_global:
-        if PRINT_REASONS: print(f"[COOLDOWN] {sym} * {side} global_cd")
-        return False
-    return True
+    # require at least MIN_TF_CONFLUENCE agreement
+    # count directions
+    sides = [a["side"] for a in analyses.values() if a.get("side")]
+    if not sides: 
+        return None
 
-def mark_sent(sym, tf, side):
-    ts = time.time()
-    _last_sent[(sym, tf, side)] = ts
-    _last_side_sent[(sym, side)] = ts
+    cnt = Counter(sides)
+    candidate_side, cnt_side = cnt.most_common(1)[0]
+    if cnt_side < MIN_TF_CONFLUENCE:
+        if DEBUG: print(f"[AGG] {sym} confluence fail sides={dict(cnt)}"); return None
 
-# ================== Döngü ==================
-def loop_once():
-    global _scanned_counter, perf_sent_total, _last_signal_ts
-    tf_list = TIMEFRAMES_SCALP + TIMEFRAMES_SWING
-    for sym in COINS:
-        for tf in tf_list:
-            _scanned_counter += 1
-            try:
-                df = get_klines(sym, tf, limit=210)
-                sigs = build_signal(df, tf, sym)
-                for s in sigs:
-                    side = s["side"]
+    # compute average score among TFs that support candidate_side
+    supporting = [a for a in analyses.values() if a.get("side")==candidate_side]
+    if len(supporting) < MIN_TF_CONFLUENCE: 
+        return None
 
-                    if s["conf"] < MIN_SEND_CONF:
-                        if PRINT_REASONS: print(f"[SKIP SEND] {s['sym']} {s['tf']} conf={s['conf']}<MIN_SEND_CONF")
-                        continue
+    avg_score = sum(a["score"] for a in supporting) / len(supporting)
+    avg_rr = sum(a["rr"] for a in supporting) / max(1, len(supporting))
+    # require volume spike in at least one TF
+    vol_ok = any(a["vol_spike"] for a in supporting)
 
-                    if not cooldown_ok(sym, tf, side):
-                        continue
+    # finalize only if meets minimums
+    if avg_score < MIN_CONF_SEND: 
+        if DEBUG: print(f"[AGG] {sym} avg_score {avg_score:.1f} < MIN_CONF_SEND"); return None
+    if avg_rr < MIN_AVG_RR:
+        if DEBUG: print(f"[AGG] {sym} avg_rr {avg_rr:.2f} < MIN_AVG_RR"); return None
+    # require either vol_ok or slope magnitude decent
+    if not vol_ok and all(abs(a["slope"])<0.01 for a in supporting):
+        if DEBUG: print(f"[AGG] {sym} no vol & weak slope"); return None
 
-                    msg = fmt_signal_card(
-                        s["sym"], s["tf"], side,
-                        s["entry"], s["tp"], s["sl"],
-                        s["rr"], s["conf"], s["slope_b"], s["slope_min"],
-                        s["lev"], s["est_min"]
-                    )
-                    send_tg(msg)
-                    mark_sent(sym, tf, side)
-                    perf_sent_total += 1
-                    perf_sent_by_sym[sym] += 1
-                    perf_rr_last.append(float(s["rr"]))
-                    _last_signal_ts = time.time()
-            except RuntimeError as e:
-                # klines failed — geofence/rate sorunları; akışı durdurma.
-                print(f"[ERROR] {sym} {tf} -> {e}")
-            except Exception as e:
-                print(f"[ERROR] {sym} {tf} -> {repr(e)}")
+    # pick best TF as primary (highest score)
+    best = max(supporting, key=lambda x: x["score"])
+    # craft candidate
+    candidate = {
+        "sym": sym,
+        "side": candidate_side,
+        "entry": best["entry"],
+        "tp": best["tp"],
+        "sl": best["sl"],
+        "avg_score": avg_score,
+        "avg_rr": avg_rr,
+        "supporting_tfs": [(a["tf"], a["score"]) for a in supporting],
+        "vol_ok": vol_ok
+    }
+    return candidate
 
-def maybe_heartbeat():
-    global _last_heartbeat_ts, _scanned_counter
-    now = time.time()
-    if (now - _last_heartbeat_ts) >= HEARTBEAT_EVERY_MIN*60:
-        send_tg(f"✅ Bot aktif\n⏳ {_scanned_counter} tarama | 📊 {perf_sent_total} sinyal")
-        _last_heartbeat_ts = now
-        _scanned_counter = 0
+# ---------- format message ----------
+def _fmt_price(x):
+    if x >= 1: return f"{x:,.4f}".replace(","," ")
+    return f"{x:.6f}".rstrip("0").rstrip(".")
 
-def maybe_silence_alert():
-    global _last_signal_ts
-    if _last_signal_ts and (time.time() - _last_signal_ts) >= SILENCE_ALERT_MIN*60:
-        send_tg(f"⚠️ {SILENCE_ALERT_MIN}+ dk sinyal yok")
-        _last_signal_ts = time.time()
+def format_signal_msg(cand):
+    badge = "🟢" if cand["avg_score"]>=85 else ("🟡" if cand["avg_score"]>=75 else "🔴")
+    header = f"{'📈' if cand['side']=='LONG' else '📉'} {cand['sym']} {badge} Score:{int(cand['avg_score'])}"
+    body = (
+        f"{header}\n"
+        f"📌 Giriş: {_fmt_price(cand['entry'])}\n"
+        f"🎯 TP: {_fmt_price(cand['tp'])}\n"
+        f"🛑 SL: {_fmt_price(cand['sl'])}\n"
+        f"⚖️ Avg R:R: {cand['avg_rr']:.2f}\n"
+        f"🔗 Confluence: {', '.join([f'{t}:{s}' for t,s in cand['supporting_tfs']])}\n"
+        f"{'🔥 Hacim spike var' if cand['vol_ok'] else ''}\n"
+        f"❗ Öneri: sabit küçük stake (örn. 2 USDT) veya bakiye %1-2. AUTO-TRADE kapalı."
+    )
+    return body
 
-def maybe_stats():
-    global _last_stats_ts
-    now = time.time()
-    if (now - _last_stats_ts) >= STATS_EVERY_HR*3600:
-        avg_rr = np.mean(perf_rr_last) if perf_rr_last else 0.0
-        send_tg(f"📊 12h Raporu\nToplam sinyal: {perf_sent_total}\nOrtalama R:R: {avg_rr:.2f}")
-        _last_stats_ts = now
-
-def main():
-    global _last_heartbeat_ts, _last_stats_ts
-    print("[BOOT] scanner VERSION: sharp-targets+geo-rot+adxfix")
-    send_tg("🟢 KriptoAlper başladı.")
-    _last_heartbeat_ts = time.time()
-    _last_stats_ts = time.time()
+# ---------- main loop ----------
+def main_loop():
+    last_cycle = 0
     while True:
         t0 = time.time()
         try:
-            loop_once()
-            maybe_heartbeat()
-            maybe_silence_alert()
-            maybe_stats()
+            candidates = []
+            for sym in COINS:
+                # skip if recent send for same sym
+                last_ts = _last_sent_ts.get(sym, 0)
+                if time.time() - last_ts < SYM_COOLDOWN_SEC:
+                    if DEBUG: print(f"[SKIP COOLDOWN] {sym}")
+                    continue
+                cand = aggregate_signals(sym)
+                if cand:
+                    candidates.append(cand)
+            # sort by avg_score and avg_rr
+            candidates.sort(key=lambda x: (x["avg_score"], x["avg_rr"]), reverse=True)
+            sent = 0
+            for c in candidates[:GLOBAL_SEND_LIMIT_PER_CYCLE]:
+                msg = format_signal_msg(c)
+                send_tg(msg)
+                _last_sent_ts[c["sym"]] = time.time()
+                sent += 1
+                if sent >= GLOBAL_SEND_LIMIT_PER_CYCLE: break
+
+            # heartbeat minimal
+            if time.time() - last_cycle > 60*15:
+                send_tg(f"✅ Bot aktif — {len(candidates)} aday, {sent} sinyal gönderildi.")
+                last_cycle = time.time()
+
         except Exception as e:
             print("[LOOP ERROR]", repr(e))
             traceback.print_exc()
+
+        # adjust sleep: allow short sleep but not too tight
         dt = time.time() - t0
-        time.sleep(max(1, 12 - dt))
+        time.sleep(max(1.5, 6 - dt))   # döngü yaklaşık 6s baz; get_klines içinde REQ_SLEEP_SEC uyacak
 
 if __name__ == "__main__":
-    main()
+    print("[BOOT] highfreq_reliable scanner starting")
+    send_tg("🟢 KriptoAlper (highfreq_reliable) başladı.")
+    main_loop()
