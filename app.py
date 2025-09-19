@@ -1,6 +1,8 @@
-import os, threading, time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, threading
 from flask import Flask
-from scanner import main  # scanner.py içindeki main()
+from scanner import main  # scanner.py içindeki main() (main_loop köprülenmiş)
 
 app = Flask(__name__)
 
@@ -9,15 +11,11 @@ def health():
     return "ok", 200
 
 def run_scanner():
-    while True:
-        try:
-            print("[APP] scanner thread starting …")
-            main()
-        except Exception as e:
-            print("[APP] scanner crashed:", repr(e))
-            time.sleep(5)  # kısa backoff ve tekrar dene
+    print("[APP] scanner thread starting …")
+    # Sonsuz döngüyü scanner tarafı yönetiyor
+    main()
 
-# Render/Gunicorn için worker başlarken tarayıcıyı ayrı thread’de aç
+# Render/Gunicorn worker ayağa kalkınca scanner'ı ayrı thread'de başlat
 t = threading.Thread(target=run_scanner, daemon=True)
 t.start()
 
