@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KriptoAlper — Futures TOP-50 (High-Signal), 60dk cooldown, 1 saatlik Heartbeat
-- Sinyal mesaj şablonu: KULLANICININ ORİJİNAL TEMPLATE_MINIMAL (emoji/metin aynen) :contentReference[oaicite:7]{index=7}
-- Dinamik evren: Binance Futures (fapi) 24h quoteVolume TOP-N (varsayılan 50)
-- Coin başına 60 dk cooldown (aynı coinden 1 saat içinde tekrar sinyal yok)
-- Heartbeat: 1 saatte bir (format yenilendi)
-- Daha üretken filtre: gevşetilmiş trend/RSI/wick/RR; güven puanı ile birlikte
-- MTF teyit ENV ile aç/kapa (varsayılan kapalı → daha çok sinyal)
-- Import uyumluluğu: main()
+KriptoAlper — Futures TOP-30, High-Signal, 60dk cooldown, 1 saatlik Heartbeat
+- Binance Futures (USDT-M) kullanır (fapi endpointleri).
+- Coin başına 60 dk cooldown (aynı coinden tekrar sinyal yok).
+- Heartbeat varsayılan 60 dk (HEARTBEAT_MIN ile ayarlanır).
+- Sinyal mesajı: Emoji “Kart Stil” + güven puanına göre KALDIRAÇ önerisi.
+- Import uyumu: main() mevcut → app.py 'from scanner import main' ile çalışır.
 """
-import os, time, sys, traceback
+import os, time, traceback
 from collections import defaultdict, deque
 
 import numpy as np
@@ -24,9 +22,9 @@ BOT_NAME = "KriptoAlper"
 
 # ================== TELEGRAM / HEARTBEAT ==================
 SEND_TO_TELEGRAM = True
-HEARTBEAT_EVERY_MIN = int(os.getenv("HEARTBEAT_MIN", "60"))     # 1 saat
+HEARTBEAT_EVERY_MIN = int(os.getenv("HEARTBEAT_MIN", "60"))      # 1 saat
 HEARTBEAT_FORCE_ON_START = os.getenv("HEARTBEAT_FORCE", "1") == "1"
-SILENCE_ALERT_MIN = int(os.getenv("SILENCE_ALERT_MIN", "180"))  # 3 saat sessizlik uyarısı
+SILENCE_ALERT_MIN = int(os.getenv("SILENCE_ALERT_MIN", "180"))   # 3 saat sessizlik uyarısı
 
 _last_heartbeat_ts = 0.0
 _last_signal_ts = None
@@ -37,7 +35,7 @@ perf_sent_by_sym = defaultdict(int)
 perf_rr_last = deque(maxlen=500)
 
 # ================== EVREN / TF ==================
-TOP_N = int(os.getenv("TOP_N", "50"))  # Futures TOP-50
+TOP_N = int(os.getenv("TOP_N", "30"))  # Futures TOP-30 (daha güvenli)
 TIMEFRAMES = ["1m","5m","15m","1h"]    # üretken
 MIN_24H_USDT_VOL = float(os.getenv("MIN_24H_USDT_VOL", "5000000"))  # 5M: likid ama kapsayıcı
 
@@ -54,7 +52,7 @@ RSI_SHORT_MAX = 60
 ATR_LEN = 14
 ATR_MULT_SL = 1.10
 ATR_MULT_TP = 2.40
-MIN_RR_BY_TF = {"1m":1.4,"5m":1.5,"15m":1.6,"1h":1.8}  # üretken
+MIN_RR_BY_TF = {"1m":1.4,"5m":1.5,"15m":1.6,"1h":1.8}
 MIN_CONFIDENCE_BY_TF = {"1m":65,"5m":68,"15m":72,"1h":78}
 
 WICK_FILTER = True
@@ -63,10 +61,6 @@ BB_LEN = 20
 
 # Cooldown (coin başına 60 dk)
 COOLDOWN_MINUTES_PER_SYMBOL = int(os.getenv("COOLDOWN_MINUTES_PER_SYMBOL","60"))
-
-# MTF teyit (opsiyonel, varsayılan kapalı → daha çok sinyal)
-MTF_CONFIRM_ENABLE = os.getenv("MTF_CONFIRM","0") == "1"
-MTF_RELAX_MAP = {"1m":["5m","15m"], "5m":["15m","1h"], "15m":["1h","4h"], "1h":["4h"]}
 
 # ================== RATE LIMIT / CACHE / HOST ==================
 REQ_SLEEP_SEC = float(os.getenv("REQ_SLEEP_SEC","0.18"))
@@ -78,24 +72,9 @@ FAPI_BASES = ["https://fapi.binance.com", "https://fapi.binance.us"]
 _fapi_idx = 0
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": f"{BOT_NAME}/high-signal-1.1"})
+SESSION.headers.update({"User-Agent": f"{BOT_NAME}/high-signal-1.2"})
 
-# --- SİNYAL MESAJ ŞABLONU (KULLANICININ ORİJİNALİ) ---
-TEMPLATE_MINIMAL = (
-    "🔒 [ULTRA SAFE]\n"
-    "Parite: 🪙 {PARITE}\n"
-    "Zaman: ⏳ {TF} ({MOD})\n"
-    "Yön: {YON}\n"
-    "Giriş: 💵 {GIRIS}\n"
-    "TP: 🎯 {TP}\n"
-    "SL: 🛑 {SL}\n"
-    "R:R: ⚖️ {RR}\n"
-    "Güven: 🔒 {GUVEN}/100\n"
-    "Süre: ⏳ ~{SURE}\n"
-    "Kaynak: Binance"
-)  # kaynak: senin mevcut dosyan:contentReference[oaicite:8]{index=8}
-
-# --- Heartbeat formatı (yenilendi) ---
+# ================== HEARTBEAT METNİ ==================
 def heartbeat_text():
     avg_rr = (sum(perf_rr_last)/len(perf_rr_last)) if perf_rr_last else 0.0
     top_syms = sorted(perf_sent_by_sym.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -172,7 +151,7 @@ def wick_filter_ok(df, lookback=2):
     return True
 def _tf_min(tf): return {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60}.get(tf,15)
 
-# ================== 24h TOP-50 Futures ==================
+# ================== 24h TOP-30 Futures ==================
 _universe = []; _last_universe_ts = 0
 def refresh_top_futures(n=TOP_N):
     global _universe, _last_universe_ts, _fapi_idx
@@ -221,6 +200,13 @@ def confidence_score(rr, slope_abs, rsi_now):
     base += min(10, slope_abs/0.05)
     base += 4 if 45 <= rsi_now <= 65 else 0
     return int(max(0, min(100, round(base))))
+def leverage_for_conf(conf: int) -> int:
+    """Güven puanına göre kaldıraç önerisi (temkinli)."""
+    if conf >= 90: return 12
+    if conf >= 80: return 9
+    if conf >= 70: return 7
+    if conf >= 60: return 5
+    return 3
 
 def build_signal(df, tf, sym):
     out = []
@@ -248,7 +234,7 @@ def build_signal(df, tf, sym):
     r_now = df["rsi"].iloc[-2]
 
     bbm = bb_mid.iloc[-2]; bbu = bb_up.iloc[-2]; bbl = bb_lo.iloc[-2]
-    not_extreme_long  = (c <= bbu)          # aşırı üst bant zorunlu değil
+    not_extreme_long  = (c <= bbu)
     not_extreme_short = (c >= bbl)
 
     def push(side, entry, tp, sl, rr, conf):
@@ -280,7 +266,9 @@ def build_signal(df, tf, sym):
 
     return out
 
-# ================== MTF teyit (opsiyonel) ==================
+# ================== MTF teyit (opsiyonel kapalı) ==================
+MTF_CONFIRM_ENABLE = os.getenv("MTF_CONFIRM","0") == "1"
+MTF_RELAX_MAP = {"1m":["5m","15m"], "5m":["15m","1h"], "15m":["1h","4h"], "1h":["4h"]}
 def mtf_confirm_if_enabled(sym, tf, side):
     if not MTF_CONFIRM_ENABLE: return True
     req = MTF_RELAX_MAP.get(tf, [])
@@ -319,20 +307,19 @@ def send_tg(text):
     except Exception as e:
         print("[TG EX]", e); return False
 
+# ================== Mesaj Formatı — Seçenek 1 (Kart Stil) ==================
 def render_message(sym, tf, mode, side, entry, tp, sl, rr, conf, est_minutes):
-    payload = {
-        "PARITE": sym,
-        "TF": tf,
-        "MOD": mode,
-        "YON": ("📈 LONG" if side == "LONG" else "📉 SHORT"),
-        "GIRIS": _fmt_price(entry),
-        "TP": _fmt_price(tp),
-        "SL": _fmt_price(sl),
-        "RR": f"{rr:.2f}",
-        "GUVEN": int(conf),
-        "SURE": f"{int(est_minutes)} dk",
-    }
-    return TEMPLATE_MINIMAL.format(**payload)  # orijinal format:contentReference[oaicite:9]{index=9}
+    lev = leverage_for_conf(int(conf))
+    return (
+        f"🪙 {sym} · ⏱ {tf} · {'📈 LONG' if side=='LONG' else '📉 SHORT'}\n\n"
+        f"💵 {_fmt_price(entry)}\n"
+        f"🎯 {_fmt_price(tp)}\n"
+        f"🛑 {_fmt_price(sl)}\n\n"
+        f"⚖️ R:R {rr:.2f}\n"
+        f"🔒 Güven {int(conf)}/100\n"
+        f"🚀 Kaldıraç {lev}x\n"
+        f"⏳ ~{int(est_minutes)} dk"
+    )
 
 # ================== Döngü ==================
 def maybe_heartbeat():
@@ -345,10 +332,10 @@ def maybe_silence_alert():
         send_tg(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok."); _last_signal_ts = time.time()
 
 def loop_once():
-    global _scanned_counter, perf_sent_total, _last_signal_ts, _last_universe_ts
+    global _scanned_counter, perf_sent_total, _last_signal_ts, _last_universe_ts, _universe
     # evren güncelle
     if (time.time() - _last_universe_ts) >= 120 or not _universe:
-        refresh_top_futures(TOP_N)
+        _universe = refresh_top_futures(TOP_N)
 
     for sym in list(_universe):
         if not cooldown_ok(sym): continue
@@ -369,10 +356,10 @@ def loop_once():
 
 def main_loop():
     global _last_heartbeat_ts
-    print("KriptoAlper — Futures TOP-50 High-Signal başlıyor…")
+    print("KriptoAlper — Futures TOP-30 High-Signal başlıyor…")
     if HEARTBEAT_FORCE_ON_START:
-        send_tg("✅ Heartbeat: hayattayım (Futures TOP-50)")
-    send_tg("🟢 KriptoAlper (Futures TOP-50) açıldı. Tarama başladı.")
+        send_tg("✅ Heartbeat: hayattayım (Futures TOP-30)")
+    send_tg("🟢 KriptoAlper (Futures TOP-30) açıldı. Tarama başladı.")
     _last_heartbeat_ts = time.time()
     while True:
         t0 = time.time()
@@ -384,7 +371,7 @@ def main_loop():
             print("Döngü istisna:", e); traceback.print_exc()
         _sleep(max(1, 12 - (time.time()-t0)))
 
-# Import uyumu (app.py: from scanner import main) :contentReference[oaicite:10]{index=10}
+# Import uyumu (app.py: from scanner import main)
 def main():
     return main_loop()
 
