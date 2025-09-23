@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown • Auto-Recovery
+- Saatlik '🟢 KriptoAlper Hayatta'
+- 3 saatte bir minimal 'Durum' özeti
 - Mesajlarda id/probe YOK (sade & emojili)
 - Binance Futures USDT-M verisi
 - Kalıcı cooldown (SQLite): aynı sembol 60 dk içinde tekrar sinyal atmaz
 - TF birleştirme: 1m/5m/15m/1h sinyalleri tek kartta
-- Rejim uyarlaması (volatiliteye göre eşikler)
-- 90 dk sinyal yoksa otomatik RELAX (eşikleri yumuşatır), sinyal gelince NORMAL
-- Heartbeat: her 60 dk durum özeti; sessizlik uyarısı 180 dk
-- Telegram gönderim: SENKRON + teslim kontrolü (yalancı sayaç yok)
+- Rejim uyarlaması + 90 dk sinyal yoksa otomatik RELAX
+- Telegram gönderim: SENKRON + teslim kontrolü
 - app.py uyumu: from scanner import main
 """
 import os, time, traceback, threading, queue, sqlite3, random
@@ -23,8 +23,11 @@ BOT_NAME = "KriptoAlper"
 
 # ================== Ayarlar ==================
 SEND_TO_TELEGRAM = True
-HEARTBEAT_MIN = 60            # dakikada bir durum mesajı
-SILENCE_ALERT_MIN = 180       # 3 saat sinyal yoksa uyar
+
+# Alive/Status periyotları
+ALIVE_MIN  = 60      # 1 saatte bir 'KriptoAlper Hayatta'
+STATUS_MIN = 180     # 3 saatte bir Durum özeti
+SILENCE_ALERT_MIN = 180  # 3 saat sinyal yoksa sessizlik uyarısı
 
 TOP_N = 30
 MIN_24H_USDT_VOL = 2_000_000  # evrene dahil minimum 24h quoteVolume (USDT)
@@ -52,7 +55,6 @@ ATR_MULT_SL, ATR_MULT_TP = 1.10, 2.40
 WICK_BODY_MAX = 1.05
 BB_LEN = 20
 MIN_RR_BY_TF = {"1m":1.35, "5m":1.45, "15m":1.55, "1h":1.75}
-MIN_CONF_BY_TF = {"1m":65, "5m":68, "15m":72, "1h":78}
 
 # ================== HTTP / Binance ==================
 FAPI_BASES = ["https://fapi.binance.com", "https://fapi.binance.us"]
@@ -197,7 +199,7 @@ def _tf_min(tf): return {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240
 
 def _fmt_price(x: float):
     if x >= 100: return f"{x:,.3f}".replace(","," ")
-    if x >= 1: return f"{x:,.5f}".replace(","," ")
+    if x >= 1:  return f"{x:,.5f}".replace(","," ")
     return f"{x:.8f}".rstrip("0").rstrip(".")
 
 def leverage_for_conf(conf: int) -> int:
@@ -362,45 +364,49 @@ def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf, est_minutes
         f"⏳ ~{int(est_minutes)} dk"
     )
 
-# ================== Heartbeat / metrikler ==================
-scanned_total = 0
-scanned_effective = 0
-skipped_cooldown = 0
-_last_heartbeat_ts = 0.0
-_last_signal_ts = None
-_last_no_signal_relax = False
+# ================== Alive & Status ==================
+_last_alive_ts = 0.0
+_last_status_ts = 0.0
 
-perf_sent_total = 0
-perf_sent_by_sym = defaultdict(int)
-perf_rr_last = deque(maxlen=500)
+def send_alive():
+    send_info("🟢 KriptoAlper Hayatta")
 
-def heartbeat_text():
-    avg_rr = (sum(perf_rr_last)/len(perf_rr_last)) if perf_rr_last else 0.0
-    top_syms = sorted(perf_sent_by_sym.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_txt = ", ".join([f"{s}:{c}" for s,c in top_syms]) if top_syms else "—"
-    last_sig = ("yok" if not _last_signal_ts else f"{int((time.time()-_last_signal_ts)//60)} dk önce")
-    mode = "RELAX" if _last_no_signal_relax else "NORMAL"
-    return (
-        f"💓 KriptoAlper — Heartbeat ({mode})\n"
-        f"• Tarama: total={scanned_total} eff={scanned_effective} skip_cd={skipped_cooldown}\n"
-        f"• Sinyal: {perf_sent_total}  • En çok: {top_txt}\n"
-        f"• Ortalama R:R: {avg_rr:.2f}\n"
-        f"• HTTP: req={http_req_count} 429={http_429_count}\n"
-        f"• Son sinyal: {last_sig}"
+def send_status(scanned, sig_count, last_sig_ts):
+    last_sig = ("yok" if not last_sig_ts else f"{int((time.time()-last_sig_ts)//60)} dk önce")
+    send_info(
+        "💓 KriptoAlper — Durum\n"
+        f"📊 {scanned} coin tarandı\n"
+        f"📈 Sinyal: {sig_count}\n"
+        f"🕒 Son sinyal: {last_sig}"
     )
 
-def maybe_heartbeat():
-    global _last_heartbeat_ts, scanned_total, scanned_effective, skipped_cooldown
-    if (time.time() - _last_heartbeat_ts) >= HEARTBEAT_MIN * 60:
-        send_info(heartbeat_text())
-        _last_heartbeat_ts = time.time()
-        scanned_total = scanned_effective = skipped_cooldown = 0
+def maybe_alive_and_status():
+    global _last_alive_ts, _last_status_ts, scanned_total, scanned_effective, skipped_cooldown
+    now = time.time()
+    if now - _last_alive_ts >= ALIVE_MIN * 60:
+        send_alive()
+        _last_alive_ts = now
+    if now - _last_status_ts >= STATUS_MIN * 60:
+        send_status(scanned_total, perf_sent_total, _last_signal_ts)
+        _last_status_ts = now
+        scanned_total = scanned_effective = skipped_cooldown = 0  # periyot sonunda reset
 
 def maybe_silence_alert():
     global _last_signal_ts
     if _last_signal_ts and (time.time() - _last_signal_ts) >= SILENCE_ALERT_MIN*60:
         send_info(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok.")
         _last_signal_ts = time.time()
+
+# ================== Heartbeat metrikleri (sayıcılar) ==================
+scanned_total = 0
+scanned_effective = 0
+skipped_cooldown = 0
+_last_signal_ts = None
+_last_no_signal_relax = False
+
+perf_sent_total = 0
+perf_sent_by_sym = defaultdict(int)
+perf_rr_last = deque(maxlen=500)
 
 # ================== Ana tarama döngüsü ==================
 _universe = []; _last_universe_ts = 0
@@ -466,11 +472,13 @@ def loop_once():
 def main_loop():
     print("KriptoAlper — Futures TOP-30 • High-Signal başlatıldı. Tarama başlıyor…")
     send_info("🟢 KriptoAlper (Futures TOP-30) çalışıyor. Tarama başladı.")
+    # açılışta hemen bir kez alive at
+    send_alive()
     while True:
         t0 = time.time()
         try:
             loop_once()
-            maybe_heartbeat()
+            maybe_alive_and_status()
             maybe_silence_alert()
         except Exception as e:
             print("Döngü istisna:", e); traceback.print_exc()
