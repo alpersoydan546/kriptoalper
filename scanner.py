@@ -2,13 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown • Auto-Recovery
-ENV'e dokunmadan stabil sinyal akışı:
-- Sinyaller SENKRON gönderim + teslim kontrolü (yalancı sayaç yok)
-- Heartbeat metrikleri: total/eff/skip_cd + HTTP req/429
-- Cooldown sırasında da analiz (sadece gönderim engellenir) → tarama görünür
-- 90 dk sinyal yoksa otomatik RELAX modu; sinyal gelince normale döner
-- İlk açılışta 1 defa test sinyali (#id:probe) → Telegram aktarımları sağlam mı görürüz
-- TF birleştirme, rejim uyarlaması, emojili kart + kaldıraç, TOP-30, SQLite cooldown
+- Mesajlarda id: yok, probe yok
+- Sinyaller gerçek Binance Futures verisine göre
+- Heartbeat ve auto-relax devam ediyor
 """
 import os, time, math, traceback, threading, queue, sqlite3, random
 from collections import defaultdict, deque
@@ -19,15 +15,15 @@ import requests
 
 BOT_NAME = "KriptoAlper"
 
-# ================== Sabitler (ENV'e gerek yok) ==================
+# ================== Sabitler ==================
 SEND_TO_TELEGRAM = True
 HEARTBEAT_MIN = 60
 SILENCE_ALERT_MIN = 180
 
 TOP_N = 30
-MIN_24H_USDT_VOL = 2_000_000  # daha kapsayıcı
+MIN_24H_USDT_VOL = 2_000_000
 COOLDOWN_MIN_PER_SYMBOL = 60
-SCAN_DURING_COOLDOWN = True    # taramayı kesmiyoruz
+SCAN_DURING_COOLDOWN = True
 
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
@@ -36,11 +32,10 @@ KLINES_CACHE_TTL = 20
 MAX_RETRY_429 = 3
 BACKOFF_BASE = 0.8
 
-# MTF teyit varsayılan kapalı (sinyal akışı için)
 MTF_CONFIRM_ENABLE = False
 MTF_RELAX_MAP = {"1m":["5m","15m"], "5m":["15m","1h"], "15m":["1h","4h"], "1h":["4h"]}
 
-# ================== Indicator eşikleri (NORMAL mod) ==================
+# ================== Indicator eşikleri ==================
 EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
 BASE_SLOPE_MIN = 0.004
 RSI_LEN = 14
@@ -80,7 +75,7 @@ def http_get(url, params=None, timeout=10):
         return r
     return None
 
-# ================== SQLite cooldown (kalıcı) ==================
+# ================== SQLite cooldown ==================
 DB_PATH = "state.db"
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute("CREATE TABLE IF NOT EXISTS cooldown (sym TEXT PRIMARY KEY, ts REAL)")
@@ -95,7 +90,7 @@ def mark_sent(sym: str):
     _db.execute("INSERT OR REPLACE INTO cooldown(sym, ts) VALUES (?,?)", (sym, time.time()))
     _db.commit()
 
-# ================== Telegram: info kuyruk + sinyal senkron ==================
+# ================== Telegram ==================
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN","")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID","")
 tg_queue: "queue.Queue[str]" = queue.Queue()
@@ -184,7 +179,6 @@ def wick_filter_ok(df, lookback=2, wick_body_max=1.05):
         if (wick/body) > wick_body_max: return False
     return True
 
-# misc helpers
 def _tf_min(tf): return {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240}.get(tf,15)
 def _fmt_price(x: float):
     if x >= 100: return f"{x:,.3f}".replace(","," ")
@@ -207,19 +201,16 @@ def detect_regime(df_close: pd.Series) -> str:
     return "normal"
 
 def regime_adjustments(regime: str, relax: bool):
-    # normal eşikler
     slope_min = BASE_SLOPE_MIN
     rsi_l, rsi_s = RSI_LONG_MIN, RSI_SHORT_MAX
     wick_max = WICK_BODY_MAX
     atr_sl, atr_tp = ATR_MULT_SL, ATR_MULT_TP
-    # rejime göre ayar
     if regime == "high":
         slope_min *= 1.2; rsi_l = max(35, rsi_l-2); rsi_s = min(65, rsi_s+2)
         wick_max = min(0.8, wick_max); atr_sl *= 1.15; atr_tp *= 1.15
     elif regime == "low":
         slope_min = max(0.003, slope_min*0.8)
         wick_max = max(1.2, wick_max); atr_tp *= 0.9
-    # RELAX modu (otomatik)
     if relax:
         slope_min = max(0.003, slope_min*0.85)
         rsi_l = min(rsi_l, 36); rsi_s = max(rsi_s, 64)
@@ -290,15 +281,12 @@ def build_signals_for_tf(df, tf, sym, adj):
     r_now = df["rsi"].iloc[-2]
 
     def push(side, entry, tp, sl, rr):
-        min_rr = MIN_RR_BY_TF.get(tf, 1.4 if tf in ("1m","5m") else 1.6)
         out.append({"sym":sym,"tf":tf,"side":side,"entry":entry,"tp":tp,"sl":sl,
                     "rr":rr,"atr":atr_n,"slope":slp,"rsi":r_now})
 
-    # LONG
     if long_tr and recent_cross_ok and dir_cross==1 and wick_ok and (r_now >= adj["rsi_long_min"]):
         entry = c; sl = entry - max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry + atr_n*adj["atr_tp"]
         rr = (tp-entry)/max((entry-sl),1e-9); push("LONG", entry, tp, sl, rr)
-    # SHORT
     if short_tr and recent_cross_ok and dir_cross==-1 and wick_ok and (r_now <= adj["rsi_short_max"]):
         entry = c; sl = entry + max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry - atr_n*adj["atr_tp"]
         rr = (entry-tp)/max((sl-entry),1e-9); push("SHORT", entry, tp, sl, rr)
@@ -334,171 +322,4 @@ def merge_signals_same_symbol(symbol_sigs):
     shorts = [s for s in symbol_sigs if s["side"]=="SHORT"]
     for group in (longs, shorts):
         if not group: continue
-        base = pick_base_signal(group)
-        if not base: continue
-        tfs = sorted({s["tf"] for s in group}, key=lambda x: TF_PRIORITY.index(x) if x in TF_PRIORITY else 99)
-        tf_bonus = min(8, 3 + 2*(len(tfs)-1))
-        conf = confidence_score(base["rr"], abs(base["slope"]), base["rsi"], tf_bonus)
-        base2 = base.copy(); base2["tf_list"] = tfs; base2["conf"] = conf
-        out.append(base2)
-    return out
-
-# =============== Message format (card) ===============
-def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf, est_minutes, msg_id):
-    tf_text = "/".join(tf_list) if isinstance(tf_list, list) else str(tf_list)
-    lev = leverage_for_conf(int(conf))
-    return (
-        f"🪙 {sym} · ⏱ {tf_text} · {'📈 LONG' if side=='LONG' else '📉 SHORT'}\n\n"
-        f"💵 {_fmt_price(entry)}\n"
-        f"🎯 {_fmt_price(tp)}\n"
-        f"🛑 {_fmt_price(sl)}\n\n"
-        f"⚖️ R:R {rr:.2f}\n"
-        f"🔒 Güven {int(conf)}/100\n"
-        f"🚀 Kaldıraç {lev}x\n"
-        f"⏳ ~{int(est_minutes)} dk\n"
-        f"#id:{msg_id}"
-    )
-
-# =============== Heartbeat / metrics ===============
-scanned_total = 0
-scanned_effective = 0
-skipped_cooldown = 0
-_last_heartbeat_ts = 0.0
-_last_signal_ts = None
-_last_probe_done = False
-_last_no_signal_relax = False  # otomatik relax flag
-
-perf_sent_total = 0
-perf_sent_by_sym = defaultdict(int)
-perf_rr_last = deque(maxlen=500)
-
-def heartbeat_text():
-    avg_rr = (sum(perf_rr_last)/len(perf_rr_last)) if perf_rr_last else 0.0
-    top_syms = sorted(perf_sent_by_sym.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_txt = ", ".join([f"{s}:{c}" for s,c in top_syms]) if top_syms else "—"
-    last_sig = ("yok" if not _last_signal_ts else f"{int((time.time()-_last_signal_ts)//60)} dk önce")
-    mode = "RELAX" if _last_no_signal_relax else "NORMAL"
-    return (
-        f"💓 KriptoAlper — Heartbeat ({mode})\n"
-        f"• Tarama: total={scanned_total} eff={scanned_effective} skip_cd={skipped_cooldown}\n"
-        f"• Sinyal: {perf_sent_total}  • En çok: {top_txt}\n"
-        f"• Ortalama R:R: {avg_rr:.2f}\n"
-        f"• HTTP: req={http_req_count} 429={http_429_count}\n"
-        f"• Son sinyal: {last_sig}"
-    )
-
-def maybe_heartbeat():
-    global _last_heartbeat_ts, scanned_total, scanned_effective, skipped_cooldown
-    if (time.time() - _last_heartbeat_ts) >= HEARTBEAT_MIN * 60:
-        send_info(heartbeat_text())
-        _last_heartbeat_ts = time.time()
-        scanned_total = scanned_effective = skipped_cooldown = 0
-
-def maybe_silence_alert():
-    global _last_signal_ts
-    if _last_signal_ts and (time.time() - _last_signal_ts) >= SILENCE_ALERT_MIN*60:
-        send_info(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok.")
-        _last_signal_ts = time.time()
-
-# =============== Main loop ===============
-_universe = []; _last_universe_ts = 0
-
-def loop_once():
-    global scanned_total, scanned_effective, skipped_cooldown, perf_sent_total, _last_signal_ts, _universe, _last_universe_ts, _last_no_signal_relax
-
-    # Universe refresh
-    if (time.time() - _last_universe_ts) >= 120 or not _universe:
-        _universe = refresh_top_futures(TOP_N); _last_universe_ts = time.time()
-
-    # Auto relax: 90 dk sinyal yoksa gevşet; sinyal gelince kapat
-    if (_last_signal_ts is None) or ((time.time() - _last_signal_ts) >= 90*60):
-        _last_no_signal_relax = True
-    else:
-        _last_no_signal_relax = False
-
-    symbol_bucket = defaultdict(list)
-
-    for sym in list(_universe):
-        scanned_total += 1
-        in_cd = not cooldown_ok(sym)
-        if in_cd and not SCAN_DURING_COOLDOWN:
-            skipped_cooldown += 1
-            continue
-
-        df1m = get_klines_cached(sym, "1m", 350)
-        if df1m is None or len(df1m) < 120:
-            continue
-        regime = detect_regime(df1m["close"])
-        adj = regime_adjustments(regime, relax=_last_no_signal_relax)
-
-        for tf in TIMEFRAMES:
-            df = df1m if tf=="1m" else get_klines_cached(sym, tf, 250)
-            sigs = build_signals_for_tf(df, tf, sym, adj)
-            if not sigs: continue
-            valids = [s for s in sigs if mtf_confirm_if_enabled(sym, tf, s["side"])]
-            if not valids: continue
-            scanned_effective += 1
-            symbol_bucket[sym].extend(valids)
-
-    for sym, arr in symbol_bucket.items():
-        merged = merge_signals_same_symbol(arr)
-        if not merged: continue
-        for ms in merged:
-            tf_list = ms.get("tf_list", [ms["tf"]])
-            rr = float(ms["rr"])
-            est_min = est_minutes_to_tp(tf_list[0] if isinstance(tf_list, list) else ms["tf"], ms["atr"], abs(ms["tp"]-ms["entry"]))
-            msg_id = int(time.time()*1000) + random.randint(10,99)
-            msg = render_message_card(sym, tf_list, ms["side"], ms["entry"], ms["tp"], ms["sl"], rr, ms["conf"], est_min, msg_id)
-            ok = send_tg_signal_sync(msg)
-            if ok:
-                print(f"[DELIVERED] {sym} id={msg_id}")
-                mark_sent(sym)
-                perf_sent_total += 1
-                perf_sent_by_sym[sym] += 1
-                perf_rr_last.append(rr)
-                _set_last_signal()
-            else:
-                print(f"[DROP] delivery failed id={msg_id} {sym}")
-
-def _set_last_signal():
-    global _last_signal_ts
-    _last_signal_ts = time.time()
-
-def telegram_diag():
-    try:
-        r1 = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=10)
-        print("[TG DIAG] getMe:", r1.status_code, r1.text[:120])
-    except Exception as e:
-        print("[TG DIAG] EX:", e)
-
-def main_loop():
-    global _last_heartbeat_ts, _last_probe_done
-    print("KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown • Auto-Recovery")
-    telegram_diag()
-    send_info("🟢 KriptoAlper (Futures TOP-30) çalışıyor. Tarama başladı.")
-    _last_heartbeat_ts = time.time()
-
-    # ilk açılışta 1 kez test sinyali (ENV'siz)
-    if not _last_probe_done:
-        _last_probe_done = True
-        probe = ("🪙 BTCUSDT · ⏱ 5m · 📈 LONG\n\n"
-                 "💵 60000\n🎯 60600\n🛑 59750\n\n"
-                 "⚖️ R:R 2.40\n🔒 Güven 80/100\n🚀 Kaldıraç 9x\n⏳ ~20 dk\n#id:probe")
-        print("[PROBE]", "DELIVERED" if send_tg_signal_sync(probe) else "FAILED")
-
-    while True:
-        t0 = time.time()
-        try:
-            loop_once()
-            maybe_heartbeat()
-            maybe_silence_alert()
-        except Exception as e:
-            print("Döngü istisna:", e); traceback.print_exc()
-        time.sleep(max(1, 12 - (time.time()-t0)))
-
-# app.py import uyumu
-def main():
-    return main_loop()
-
-if __name__ == "__main__":
-    main_loop()
+        base = pick_base_signal
