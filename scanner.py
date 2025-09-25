@@ -5,11 +5,11 @@ KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown 
 - Saatlik '🟢 KriptoAlper Hayatta'
 - 3 saatte bir minimal 'Durum' özeti
 - Mesajlarda id/probe YOK (sade & emojili)
-- Binance Futures USDT-M verisi
+- Binance Futures USDT-M verisi; FUTURES erişilemezse SPOT’a otomatik fallback
 - Kalıcı cooldown (SQLite): aynı sembol 60 dk içinde tekrar sinyal atmaz
 - TF birleştirme: 1m/5m/15m/1h sinyalleri tek kartta
 - Rejim uyarlaması + 90 dk sinyal yoksa otomatik RELAX
-- Telegram gönderim: SENKRON + teslim kontrolü
+- Telegram gönderim: senkron + teslim kontrolü
 - app.py uyumu: from scanner import main
 """
 import os, time, traceback, threading, queue, sqlite3, random
@@ -45,22 +45,30 @@ MTF_CONFIRM_ENABLE = False
 MTF_RELAX_MAP = {"1m":["5m","15m"], "5m":["15m","1h"], "15m":["1h","4h"], "1h":["4h"]}
 TF_PRIORITY = ["5m","15m","1m","1h"]
 
-# ================== Eşikler (NORMAL) ==================
+# ================== Eşikler (yumuşatılmış) ==================
 EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
-BASE_SLOPE_MIN = 0.004
+BASE_SLOPE_MIN = 0.0025                 # 0.004 -> 0.0025 (trend filtresi gevşetildi)
 RSI_LEN = 14
-RSI_LONG_MIN, RSI_SHORT_MAX = 38, 62
+RSI_LONG_MIN, RSI_SHORT_MAX = 35, 65    # 38/62 -> 35/65
 ATR_LEN = 14
-ATR_MULT_SL, ATR_MULT_TP = 1.10, 2.40
-WICK_BODY_MAX = 1.05
+ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.20   # 1.10/2.40 -> 1.00/2.20
+WICK_BODY_MAX = 1.25                    # 1.05 -> 1.25
 BB_LEN = 20
-MIN_RR_BY_TF = {"1m":1.35, "5m":1.45, "15m":1.55, "1h":1.75}
+MIN_RR_BY_TF = {"1m":1.25, "5m":1.35, "15m":1.45, "1h":1.60}
 
-# ================== HTTP / Binance ==================
-FAPI_BASES = ["https://fapi.binance.com", "https://fapi.binance.us"]
+# ================== HTTP / Binance (Futures + Spot fallback) ==================
+FAPI_BASES = [
+    "https://fapi.binance.com",
+    "https://futures.binance.com",
+]
+SPOT_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+]
 _fapi_idx = 0
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": f"{BOT_NAME}/stable-v3"})
+_session = requests.Session()
+_session.headers.update({"User-Agent": f"{BOT_NAME}/stable-v3"})
 http_429_count = 0
 http_req_count = 0
 
@@ -68,10 +76,11 @@ def _fapi_base():
     return FAPI_BASES[_fapi_idx % len(FAPI_BASES)]
 
 def http_get(url, params=None, timeout=10):
+    """Futures çağrıları için."""
     global _fapi_idx, http_429_count, http_req_count
     for i in range(MAX_RETRY_429 + 1):
         try:
-            r = SESSION.get(url, params=params, timeout=timeout)
+            r = _session.get(url, params=params, timeout=timeout)
             http_req_count += 1
         except Exception:
             time.sleep((i+1)*0.5); continue
@@ -82,6 +91,16 @@ def http_get(url, params=None, timeout=10):
             _fapi_idx += 1
             time.sleep((i+1)*0.8); continue
         return r
+    return None
+
+def http_get_spot(path, params=None, timeout=10):
+    for base in SPOT_BASES:
+        try:
+            r = _session.get(base + path, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+        except Exception:
+            pass
     return None
 
 # ================== SQLite cooldown ==================
@@ -184,13 +203,14 @@ def last_cross_bars(fast, slow):
     direction = 1 if (fast.iloc[idx[-1]+1] > slow.iloc[idx[-1]+1]) else -1
     return bars_ago, direction
 
-def wick_filter_ok(df, lookback=2, wick_body_max=1.05):
+def wick_filter_ok(df, lookback=2, wick_body_max=1.25):
     if len(df) < lookback+1: return True
     for i in range(1, lookback+1):
         o = df["open"].iloc[-i]; c = df["close"].iloc[-i]
         h = df["high"].iloc[-i]; l = df["low"].iloc[-i]
         body = abs(c-o); upper = h - max(o,c); lower = min(o,c) - l
-        wick = upper + lower; body = body if body!=0 else 1e-9
+        body = body if body!=0 else 1e-9
+        wick = (h - max(o,c)) + (min(o,c) - l)
         if (wick/body) > wick_body_max: return False
     return True
 
@@ -242,31 +262,74 @@ _universe = []; _last_universe_ts = 0
 _KLINES_CACHE = {}  # (sym, tf) -> (ts, df)
 
 def refresh_top_futures(n=TOP_N):
+    # Önce futures 24h ticker
     r = http_get(f"{_fapi_base()}/fapi/v1/ticker/24hr")
-    if not r or r.status_code != 200:
-        if not _universe:
-            _universe[:] = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","AVAXUSDT","ADAUSDT","DOGEUSDT"]
-        return _universe
-    arr = r.json()
-    usdt = [it for it in arr if it.get("symbol","").endswith("USDT")]
-    usdt_sorted = sorted(usdt, key=lambda x: float(x.get("quoteVolume",0.0)), reverse=True)
-    top = [it["symbol"] for it in usdt_sorted if float(it.get("quoteVolume",0.0))>=MIN_24H_USDT_VOL][:n]
-    _universe[:] = top if top else _universe
+    if r and r.status_code == 200:
+        arr = r.json()
+        usdt = [it for it in arr if it.get("symbol","").endswith("USDT")]
+        usdt_sorted = sorted(usdt, key=lambda x: float(x.get("quoteVolume",0.0)), reverse=True)
+        top = [it["symbol"] for it in usdt_sorted if float(it.get("quoteVolume",0.0))>=MIN_24H_USDT_VOL][:n]
+        _universe[:] = top if top else _universe
+        if _universe:
+            return _universe
+    # Fallback: SPOT 24h ticker
+    r2 = http_get_spot("/api/v3/ticker/24hr")
+    if r2 and r2.status_code == 200:
+        arr2 = r2.json()
+        usdt2 = [it for it in arr2 if it.get("symbol","").endswith("USDT")]
+        usdt2 = [it for it in usdt2 if not it["symbol"].endswith("BUSD")]
+        usdt_sorted2 = sorted(usdt2, key=lambda x: float(x.get("quoteVolume",0.0)), reverse=True)
+        top2 = [it["symbol"] for it in usdt_sorted2 if float(it.get("quoteVolume",0.0))>=MIN_24H_USDT_VOL][:n]
+        if top2:
+            _universe[:] = top2
+            print("[FALLBACK] Universe → SPOT 24h ticker")
+            return _universe
+    # Son çare: sabit liste
+    if not _universe:
+        _universe[:] = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","AVAXUSDT","ADAUSDT","DOGEUSDT"]
     return _universe
+
+def get_spot_klines(symbol, interval, limit=250):
+    r = http_get_spot("/api/v3/klines", params={
+        "symbol": symbol.replace("PERP",""),
+        "interval": interval,
+        "limit": limit
+    })
+    if not r or r.status_code != 200:
+        return None
+    arr = r.json()
+    cols = ["open_time","open","high","low","close","volume","close_time","qav","nt","tb","tq","i"]
+    df = pd.DataFrame(arr, columns=cols)
+    for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df
 
 def get_klines_cached(symbol, interval, limit=250):
     key = (symbol, interval); now = time.time()
     ts_df = _KLINES_CACHE.get(key)
     if ts_df and (now - ts_df[0] <= KLINES_CACHE_TTL):
         return ts_df[1]
+
+    # Futures dene
     time.sleep(REQ_SLEEP_SEC)
-    r = http_get(f"{_fapi_base()}/fapi/v1/klines", params={"symbol":symbol,"interval":interval,"limit":limit})
-    if not r or r.status_code != 200: return None
-    arr = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time","qav","nt","tb","tq","i"]
-    df = pd.DataFrame(arr, columns=cols)
-    for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    r = http_get(f"{_fapi_base()}/fapi/v1/klines",
+                 params={"symbol":symbol,"interval":interval,"limit":limit})
+    df = None
+    if r and r.status_code == 200:
+        arr = r.json()
+        cols = ["open_time","open","high","low","close","volume","close_time","qav","nt","tb","tq","i"]
+        df = pd.DataFrame(arr, columns=cols)
+        for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    else:
+        # SPOT fallback
+        df = get_spot_klines(symbol, interval, limit)
+        if df is not None:
+            print(f"[FALLBACK] {symbol} {interval} → SPOT klines")
+
+    if df is None:
+        return None
+
     _KLINES_CACHE[key] = (now, df)
     return df
 
@@ -278,6 +341,7 @@ def confidence_score(rr, slope_abs, rsi_now, tf_bonus):
 def build_signals_for_tf(df, tf, sym, adj):
     out = []
     if df is None or len(df) < 60: return out
+
     df = df.copy()
     df["ema_fast"] = ema(df["close"], EMA_FAST)
     df["ema_slow"] = ema(df["close"], EMA_SLOW)
@@ -295,7 +359,7 @@ def build_signals_for_tf(df, tf, sym, adj):
     short_tr = (c < base) and (slp <= -adj["slope_min"])
 
     bars_ago, dir_cross = last_cross_bars(df["ema_fast"], df["ema_slow"])
-    recent_cross_ok = (bars_ago is not None) and (bars_ago <= 30)
+    recent_cross_ok = (bars_ago is not None) and (bars_ago <= 60)  # 30 -> 60
     wick_ok = wick_filter_ok(df, 2, adj["wick_body_max"])
     r_now = df["rsi"].iloc[-2]
 
@@ -303,13 +367,34 @@ def build_signals_for_tf(df, tf, sym, adj):
         out.append({"sym":sym,"tf":tf,"side":side,"entry":entry,"tp":tp,"sl":sl,
                     "rr":rr,"atr":atr_n,"slope":slp,"rsi":r_now})
 
+    # --- Trend + EMA kesişimi ---
     if long_tr and recent_cross_ok and dir_cross==1 and wick_ok and (r_now >= adj["rsi_long_min"]):
         entry = c; sl = entry - max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry + atr_n*adj["atr_tp"]
-        rr = (tp-entry)/max((entry-sl),1e-9); push("LONG", entry, tp, sl, rr)
+        rr = (tp-entry)/max((entry-sl),1e-9); 
+        if rr >= MIN_RR_BY_TF.get(tf,1.3): push("LONG", entry, tp, sl, rr)
 
     if short_tr and recent_cross_ok and dir_cross==-1 and wick_ok and (r_now <= adj["rsi_short_max"]):
         entry = c; sl = entry + max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry - atr_n*adj["atr_tp"]
-        rr = (entry-tp)/max((sl-entry),1e-9); push("SHORT", entry, tp, sl, rr)
+        rr = (entry-tp)/max((sl-entry),1e-9);
+        if rr >= MIN_RR_BY_TF.get(tf,1.3): push("SHORT", entry, tp, sl, rr)
+
+    # --- Breakout alternatifi (BB üst/alt kırılım) ---
+    dist_base = abs(c - base) / max(base, 1e-9)
+    if (c > bb_up.iloc[-2]) and (slp > 0 or c > base) and (dist_base <= 0.03) and wick_ok:
+        entry = c
+        sl = min(df["low"].iloc[-3:-1].min(), entry - max(atr_n*ATR_MULT_SL, 1e-9*entry))
+        tp = entry + atr_n*ATR_MULT_TP
+        rr = (tp-entry)/max((entry-sl),1e-9)
+        if rr >= MIN_RR_BY_TF.get(tf,1.3):
+            push("LONG", entry, tp, sl, rr)
+
+    if (c < bb_lo.iloc[-2]) and (slp < 0 or c < base) and (dist_base <= 0.03) and wick_ok:
+        entry = c
+        sl = max(df["high"].iloc[-3:-1].max(), entry + max(atr_n*ATR_MULT_SL, 1e-9*entry))
+        tp = entry - atr_n*ATR_MULT_TP
+        rr = (entry-tp)/max((sl-entry),1e-9)
+        if rr >= MIN_RR_BY_TF.get(tf,1.3):
+            push("SHORT", entry, tp, sl, rr)
 
     return out
 
@@ -397,7 +482,7 @@ def maybe_silence_alert():
         send_info(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok.")
         _last_signal_ts = time.time()
 
-# ================== Heartbeat metrikleri (sayıcılar) ==================
+# ================== Sayaçlar ==================
 scanned_total = 0
 scanned_effective = 0
 skipped_cooldown = 0
@@ -425,6 +510,7 @@ def loop_once():
         _last_no_signal_relax = False
 
     symbol_bucket = defaultdict(list)
+    fetched_ok = 0
 
     for sym in list(_universe):
         scanned_total += 1
@@ -436,6 +522,8 @@ def loop_once():
         df1m = get_klines_cached(sym, "1m", 350)
         if df1m is None or len(df1m) < 120:
             continue
+        fetched_ok += 1
+
         regime = detect_regime(df1m["close"])
         adj = regime_adjustments(regime, relax=_last_no_signal_relax)
 
@@ -447,6 +535,10 @@ def loop_once():
             if not valids: continue
             scanned_effective += 1
             symbol_bucket[sym].extend(valids)
+
+    # Nadir diyagnostik log
+    if random.random() < 0.02:
+        print(f"[DIAG] fetched_ok={fetched_ok}/{len(_universe)}")
 
     # Gönderim: TF birleştir ve gönder
     for sym, arr in symbol_bucket.items():
@@ -472,8 +564,7 @@ def loop_once():
 def main_loop():
     print("KriptoAlper — Futures TOP-30 • High-Signal başlatıldı. Tarama başlıyor…")
     send_info("🟢 KriptoAlper (Futures TOP-30) çalışıyor. Tarama başladı.")
-    # açılışta hemen bir kez alive at
-    send_alive()
+    send_alive()  # açılışta bir kere
     while True:
         t0 = time.time()
         try:
