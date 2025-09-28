@@ -4,6 +4,7 @@
 KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown • Auto-Recovery
 - Saatlik '🟢 KriptoAlper Hayatta'
 - 3 saatte bir minimal 'Durum' özeti
+- 📈 Performans takibi: sinyaller DB'ye kaydolur, 1m bar ile TP/SL takibi, saatlik özet
 - Mesajlarda id/probe YOK (sade & emojili)
 - Binance Futures USDT-M verisi; FUTURES erişilemezse SPOT’a otomatik fallback
 - Kalıcı cooldown (SQLite): aynı sembol 60 dk içinde tekrar sinyal atmaz
@@ -19,6 +20,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+# --- Performans izleme (yeni) ---
+from perf import record_signal, evaluate_pending, render_summary_text
+
 BOT_NAME = "KriptoAlper"
 
 # ================== Ayarlar ==================
@@ -28,11 +32,12 @@ SEND_TO_TELEGRAM = True
 ALIVE_MIN  = 60      # 1 saatte bir 'KriptoAlper Hayatta'
 STATUS_MIN = 180     # 3 saatte bir Durum özeti
 SILENCE_ALERT_MIN = 180  # 3 saat sinyal yoksa sessizlik uyarısı
+PERF_SUMMARY_MIN = 60    # 1 saatte bir performans özeti
 
 TOP_N = 30
-MIN_24H_USDT_VOL = 2_000_000  # evrene dahil minimum 24h quoteVolume (USDT)
-COOLDOWN_MIN_PER_SYMBOL = 60  # aynı sembole 60 dk cooldown
-SCAN_DURING_COOLDOWN = True   # cooldown'da analiz yap, sadece gönderimi engelle
+MIN_24H_USDT_VOL = 2_000_000
+COOLDOWN_MIN_PER_SYMBOL = 60
+SCAN_DURING_COOLDOWN = True
 
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
@@ -47,12 +52,12 @@ TF_PRIORITY = ["5m","15m","1m","1h"]
 
 # ================== Eşikler (yumuşatılmış) ==================
 EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
-BASE_SLOPE_MIN = 0.0025                 # 0.004 -> 0.0025 (trend filtresi gevşetildi)
+BASE_SLOPE_MIN = 0.0025
 RSI_LEN = 14
-RSI_LONG_MIN, RSI_SHORT_MAX = 35, 65    # 38/62 -> 35/65
+RSI_LONG_MIN, RSI_SHORT_MAX = 35, 65
 ATR_LEN = 14
-ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.20   # 1.10/2.40 -> 1.00/2.20
-WICK_BODY_MAX = 1.25                    # 1.05 -> 1.25
+ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.20
+WICK_BODY_MAX = 1.25
 BB_LEN = 20
 MIN_RR_BY_TF = {"1m":1.25, "5m":1.35, "15m":1.45, "1h":1.60}
 
@@ -359,7 +364,7 @@ def build_signals_for_tf(df, tf, sym, adj):
     short_tr = (c < base) and (slp <= -adj["slope_min"])
 
     bars_ago, dir_cross = last_cross_bars(df["ema_fast"], df["ema_slow"])
-    recent_cross_ok = (bars_ago is not None) and (bars_ago <= 60)  # 30 -> 60
+    recent_cross_ok = (bars_ago is not None) and (bars_ago <= 60)
     wick_ok = wick_filter_ok(df, 2, adj["wick_body_max"])
     r_now = df["rsi"].iloc[-2]
 
@@ -449,9 +454,10 @@ def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf, est_minutes
         f"⏳ ~{int(est_minutes)} dk"
     )
 
-# ================== Alive & Status ==================
+# ================== Alive & Status & Perf ==================
 _last_alive_ts = 0.0
 _last_status_ts = 0.0
+_last_perf_ts   = 0.0
 
 def send_alive():
     send_info("🟢 KriptoAlper Hayatta")
@@ -465,8 +471,8 @@ def send_status(scanned, sig_count, last_sig_ts):
         f"🕒 Son sinyal: {last_sig}"
     )
 
-def maybe_alive_and_status():
-    global _last_alive_ts, _last_status_ts, scanned_total, scanned_effective, skipped_cooldown
+def maybe_alive_and_status_and_perf():
+    global _last_alive_ts, _last_status_ts, _last_perf_ts, scanned_total, scanned_effective, skipped_cooldown
     now = time.time()
     if now - _last_alive_ts >= ALIVE_MIN * 60:
         send_alive()
@@ -474,7 +480,13 @@ def maybe_alive_and_status():
     if now - _last_status_ts >= STATUS_MIN * 60:
         send_status(scanned_total, perf_sent_total, _last_signal_ts)
         _last_status_ts = now
-        scanned_total = scanned_effective = skipped_cooldown = 0  # periyot sonunda reset
+        scanned_total = scanned_effective = skipped_cooldown = 0
+    if now - _last_perf_ts >= PERF_SUMMARY_MIN * 60:
+        try:
+            send_info(render_summary_text(60))
+        except Exception as e:
+            print("[PERF MSG ERR]", e)
+        _last_perf_ts = now
 
 def maybe_silence_alert():
     global _last_signal_ts
@@ -503,7 +515,7 @@ def loop_once():
     if (time.time() - _last_universe_ts) >= 120 or not _universe:
         _universe = refresh_top_futures(TOP_N); _last_universe_ts = time.time()
 
-    # Auto relax: 90 dk sinyal yoksa gevşet; sinyal gelince normale dön
+    # Auto relax
     if (_last_signal_ts is None) or ((time.time() - _last_signal_ts) >= 90*60):
         _last_no_signal_relax = True
     else:
@@ -557,6 +569,15 @@ def loop_once():
                 perf_sent_by_sym[sym] += 1
                 perf_rr_last.append(rr)
                 _last_signal_ts = time.time()
+                # --- performans kaydı (yeni) ---
+                try:
+                    record_signal({
+                        "sym": sym, "side": ms["side"], "tf_list": tf_list,
+                        "entry": ms["entry"], "sl": ms["sl"], "tp": ms["tp"],
+                        "rr": rr, "conf": ms["conf"]
+                    })
+                except Exception as e:
+                    print("[PERF REC ERR]", e)
             else:
                 print(f"[DROP] delivery failed {sym}")
 
@@ -568,8 +589,14 @@ def main_loop():
     while True:
         t0 = time.time()
         try:
+            # --- açık sinyallerin TP/SL kontrolü (yeni) ---
+            try:
+                evaluate_pending(get_klines_cached)
+            except Exception as e:
+                print("[PERF EVAL ERR]", e)
+
             loop_once()
-            maybe_alive_and_status()
+            maybe_alive_and_status_and_perf()
             maybe_silence_alert()
         except Exception as e:
             print("Döngü istisna:", e); traceback.print_exc()
