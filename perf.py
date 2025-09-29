@@ -1,6 +1,5 @@
-# perf.py — KriptoAlper sinyal performans takibi
+# perf.py — KriptoAlper sinyal performans takibi (state.db uyumlu)
 import sqlite3, time
-import pandas as pd
 
 DB = sqlite3.connect("state.db", check_same_thread=False)
 DB.execute("""
@@ -15,8 +14,8 @@ CREATE TABLE IF NOT EXISTS signals(
 )""")
 DB.commit()
 
-HORIZON_MIN_DEFAULT = 240  # 4 saat içinde sonuçlanmayanlar EXPIRED
-EVAL_BAR_TF = "1m"         # değerlendirme 1m klines üstünden
+HORIZON_MIN_DEFAULT = 240  # 4 saat
+EVAL_BAR_TF = "1m"         # değerlendirme 1m üzerinden
 
 def record_signal(sig: dict, horizon_min: int = HORIZON_MIN_DEFAULT):
     DB.execute("""INSERT INTO signals(ts,sym,side,tf,entry,tp,sl,rr,conf,status,outcome_ts,horizon_min)
@@ -113,3 +112,30 @@ def render_summary_text(minutes=60):
         f"• ⏳ Açık: {s['open']}\n"
         f"• Başarı: {s['succ']:.0f}%"
     )
+
+def render_detail_text(minutes=60, max_rows=40):
+    """
+    Son 'minutes' içinde atılan sinyallerin detaylı listesi.
+    Uzamayı önlemek için 'max_rows' kadar satır döker.
+    """
+    now = time.time(); t0 = now - minutes*60
+    rows = DB.execute("""
+        SELECT ts, sym, side, tf, entry, tp, sl, status
+        FROM signals
+        WHERE ts>=?
+        ORDER BY ts DESC
+        LIMIT ?
+    """, (t0, int(max_rows))).fetchall()
+
+    if not rows:
+        return f"📋 Detay — Son {minutes} dk: kayıt yok."
+
+    lines = [f"📋 Detaylı Rapor — Son {minutes} dk"]
+    for ts, sym, side, tf, entry, tp, sl, status in rows:
+        icon = "🎯" if status=="TP" else "🛑" if status=="SL" else "⏳" if status=="NEW" else "❔"
+        side_txt = "LONG" if side=="LONG" else "SHORT"
+        lines.append(f"{icon} {sym} {side_txt} [{tf}] | Giriş {entry:.6f} | TP {tp:.6f} | SL {sl:.6f} → {status}")
+
+    if len(rows) == max_rows:
+        lines.append(f"… (ilk {max_rows} satır gösterildi)")
+    return "\n".join(lines)
