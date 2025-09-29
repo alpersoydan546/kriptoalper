@@ -5,11 +5,11 @@ KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown 
 - Saatlik '🟢 KriptoAlper Hayatta'
 - 3 saatte bir 'Durum' özeti
 - 📈 Performans takibi: sinyaller DB'ye kaydolur, 1m bar ile TP/SL takibi
--   ⏱ Özeti 3 saatte bir, 📋 detaylı listeyi saatte bir gönderir
+-   ⏱ Özeti 3 saatte bir (son 180 dk), 📋 detaylı listeyi saatte bir (son 60 dk) gönderir
 - Mesajlarda id/probe YOK (sade & emojili)
 - Binance Futures USDT-M verisi; FUTURES erişilemezse SPOT’a otomatik fallback
 - Kalıcı cooldown (SQLite): aynı sembol 60 dk içinde tekrar sinyal atmaz
-- TF birleştirme: 1m/5m/15m/1h sinyalleri tek kartta
+- TF birleştirme: 5m/15m/1h sinyalleri tek kartta (1m SİNYAL ÜRETMEZ)
 - Rejim uyarlaması + 90 dk sinyal yoksa otomatik RELAX
 - Telegram gönderim: senkron + teslim kontrolü
 - app.py uyumu: from scanner import main
@@ -25,8 +25,8 @@ import requests
 from perf import (
     record_signal,
     evaluate_pending,
-    render_summary_text,  # özet
-    render_detail_text,   # detaylı liste
+    render_summary_text,  # özet (3 saatte bir)
+    render_detail_text,   # detaylı liste (saatte bir) — kapalıları listeler
 )
 
 BOT_NAME = "KriptoAlper"
@@ -46,7 +46,8 @@ MIN_24H_USDT_VOL = 2_000_000
 COOLDOWN_MIN_PER_SYMBOL = 60
 SCAN_DURING_COOLDOWN = True
 
-TIMEFRAMES = ["1m", "5m", "15m", "1h"]
+# ❗ 1m sinyal üretimi KAPALI — sadece 5m/15m (+1h destek)
+TIMEFRAMES = ["5m", "15m", "1h"]
 
 # --- Sinyal filtre eşiği ---
 CONF_MIN = 70  # Güven < 70 olan sinyaller gönderilmeyecek
@@ -57,8 +58,8 @@ MAX_RETRY_429 = 3
 BACKOFF_BASE = 0.8
 
 MTF_CONFIRM_ENABLE = False
-MTF_RELAX_MAP = {"1m":["5m","15m"], "5m":["15m","1h"], "15m":["1h","4h"], "1h":["4h"]}
-TF_PRIORITY = ["5m","15m","1m","1h"]
+MTF_RELAX_MAP = {"5m":["15m","1h"], "15m":["1h"], "1h":["4h"]}
+TF_PRIORITY = ["5m","15m","1h"]  # 1m çıkarıldı
 
 # ================== Eşikler (yumuşatılmış) ==================
 EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
@@ -69,7 +70,7 @@ ATR_LEN = 14
 ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.20
 WICK_BODY_MAX = 1.25
 BB_LEN = 20
-MIN_RR_BY_TF = {"1m":1.25, "5m":1.35, "15m":1.45, "1h":1.60}
+MIN_RR_BY_TF = {"5m":1.35, "15m":1.45, "1h":1.60}
 
 # ================== HTTP / Binance (Futures + Spot fallback) ==================
 FAPI_BASES = [
@@ -226,7 +227,6 @@ def wick_filter_ok(df, lookback=2, wick_body_max=1.25):
         body = abs(c-o); body = body if body!=0 else 1e-9
         wick = (h - max(o,c)) + (min(o,c) - l)
         if (wick/body) > wick_body_max: return False
-        # üst+alt fitil toplamını kontrol ediyoruz
     return True
 
 # ================== Yardımcılar ==================
@@ -386,12 +386,12 @@ def build_signals_for_tf(df, tf, sym, adj):
     if long_tr and recent_cross_ok and dir_cross==1 and wick_ok and (r_now >= adj["rsi_long_min"]):
         entry = c; sl = entry - max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry + atr_n*adj["atr_tp"]
         rr = (tp-entry)/max((entry-sl),1e-9); 
-        if rr >= MIN_RR_BY_TF.get(tf,1.3): push("LONG", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.35): push("LONG", entry, tp, sl, rr)
 
     if short_tr and recent_cross_ok and dir_cross==-1 and wick_ok and (r_now <= adj["rsi_short_max"]):
         entry = c; sl = entry + max(atr_n*adj["atr_sl"], 1e-9*entry); tp = entry - atr_n*adj["atr_tp"]
         rr = (entry-tp)/max((sl-entry),1e-9);
-        if rr >= MIN_RR_BY_TF.get(tf,1.3): push("SHORT", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.35): push("SHORT", entry, tp, sl, rr)
 
     # --- Breakout alternatifi (BB üst/alt kırılım) ---
     dist_base = abs(c - base) / max(base, 1e-9)
@@ -400,7 +400,7 @@ def build_signals_for_tf(df, tf, sym, adj):
         sl = min(df["low"].iloc[-3:-1].min(), entry - max(atr_n*ATR_MULT_SL, 1e-9*entry))
         tp = entry + atr_n*ATR_MULT_TP
         rr = (tp-entry)/max((entry-sl),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.3):
+        if rr >= MIN_RR_BY_TF.get(tf,1.35):
             push("LONG", entry, tp, sl, rr)
 
     if (c < bb_lo.iloc[-2]) and (slp < 0 or c < base) and (dist_base <= 0.03) and wick_ok:
@@ -408,7 +408,7 @@ def build_signals_for_tf(df, tf, sym, adj):
         sl = max(df["high"].iloc[-3:-1].max(), entry + max(atr_n*ATR_MULT_SL, 1e-9*entry))
         tp = entry - atr_n*ATR_MULT_TP
         rr = (entry-tp)/max((sl-entry),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.3):
+        if rr >= MIN_RR_BY_TF.get(tf,1.35):
             push("SHORT", entry, tp, sl, rr)
 
     return out
@@ -500,7 +500,7 @@ def maybe_alive_and_status_and_perf():
         _last_perf_ts = now
     if now - _last_detail_ts >= PERF_DETAIL_MIN * 60:
         try:
-            send_info(render_detail_text(60, max_rows=40))  # saatlik detay
+            send_info(render_detail_text(60, max_rows=40))  # saatlik detay (kapalıları listeler)
         except Exception as e:
             print("[PERF DETAIL ERR]", e)
         _last_detail_ts = now
@@ -541,6 +541,7 @@ def loop_once():
     symbol_bucket = defaultdict(list)
     fetched_ok = 0
 
+    # 1m sadece rejim/yardımcı metrikler için çekiliyor; sinyal üretmiyoruz
     for sym in list(_universe):
         scanned_total += 1
         in_cd = not cooldown_ok(sym)
@@ -557,7 +558,7 @@ def loop_once():
         adj = regime_adjustments(regime, relax=_last_no_signal_relax)
 
         for tf in TIMEFRAMES:
-            df = df1m if tf=="1m" else get_klines_cached(sym, tf, 250)
+            df = get_klines_cached(sym, tf, 250)
             sigs = build_signals_for_tf(df, tf, sym, adj)
             if not sigs: continue
             valids = [s for s in sigs if mtf_confirm_if_enabled(sym, tf, s["side"])]
