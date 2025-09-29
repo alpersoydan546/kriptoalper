@@ -3,8 +3,9 @@
 """
 KriptoAlper — Futures TOP-30 • High-Signal • TF Merge • SQLite Cooldown • Auto-Recovery
 - Saatlik '🟢 KriptoAlper Hayatta'
-- 3 saatte bir minimal 'Durum' özeti
-- 📈 Performans takibi: sinyaller DB'ye kaydolur, 1m bar ile TP/SL takibi, saatlik özet
+- 3 saatte bir 'Durum' özeti
+- 📈 Performans takibi: sinyaller DB'ye kaydolur, 1m bar ile TP/SL takibi
+-   ⏱ Özeti 3 saatte bir, 📋 detaylı listeyi saatte bir gönderir
 - Mesajlarda id/probe YOK (sade & emojili)
 - Binance Futures USDT-M verisi; FUTURES erişilemezse SPOT’a otomatik fallback
 - Kalıcı cooldown (SQLite): aynı sembol 60 dk içinde tekrar sinyal atmaz
@@ -20,19 +21,25 @@ import numpy as np
 import pandas as pd
 import requests
 
-# --- Performans izleme (yeni) ---
-from perf import record_signal, evaluate_pending, render_summary_text
+# --- Performans izleme ---
+from perf import (
+    record_signal,
+    evaluate_pending,
+    render_summary_text,  # özet
+    render_detail_text,   # detaylı liste
+)
 
 BOT_NAME = "KriptoAlper"
 
 # ================== Ayarlar ==================
 SEND_TO_TELEGRAM = True
 
-# Alive/Status periyotları
-ALIVE_MIN  = 60      # 1 saatte bir 'KriptoAlper Hayatta'
-STATUS_MIN = 180     # 3 saatte bir Durum özeti
-SILENCE_ALERT_MIN = 180  # 3 saat sinyal yoksa sessizlik uyarısı
-PERF_SUMMARY_MIN = 60    # 1 saatte bir performans özeti
+# Alive/Status/Perf periyotları
+ALIVE_MIN         = 60    # 1 saatte bir 'KriptoAlper Hayatta'
+STATUS_MIN        = 180   # 3 saatte bir Durum özeti
+SILENCE_ALERT_MIN = 180   # 3 saat sinyal yoksa uyarı
+PERF_SUMMARY_MIN  = 180   # 3 saatte bir performans özeti (son 180 dk)
+PERF_DETAIL_MIN   = 60    # 1 saatte bir detaylı liste (son 60 dk)
 
 TOP_N = 30
 MIN_24H_USDT_VOL = 2_000_000
@@ -40,6 +47,9 @@ COOLDOWN_MIN_PER_SYMBOL = 60
 SCAN_DURING_COOLDOWN = True
 
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
+
+# --- Sinyal filtre eşiği ---
+CONF_MIN = 70  # Güven < 70 olan sinyaller gönderilmeyecek
 
 REQ_SLEEP_SEC = 0.18
 KLINES_CACHE_TTL = 20
@@ -213,10 +223,10 @@ def wick_filter_ok(df, lookback=2, wick_body_max=1.25):
     for i in range(1, lookback+1):
         o = df["open"].iloc[-i]; c = df["close"].iloc[-i]
         h = df["high"].iloc[-i]; l = df["low"].iloc[-i]
-        body = abs(c-o); upper = h - max(o,c); lower = min(o,c) - l
-        body = body if body!=0 else 1e-9
+        body = abs(c-o); body = body if body!=0 else 1e-9
         wick = (h - max(o,c)) + (min(o,c) - l)
         if (wick/body) > wick_body_max: return False
+        # üst+alt fitil toplamını kontrol ediyoruz
     return True
 
 # ================== Yardımcılar ==================
@@ -458,6 +468,7 @@ def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf, est_minutes
 _last_alive_ts = 0.0
 _last_status_ts = 0.0
 _last_perf_ts   = 0.0
+_last_detail_ts = 0.0
 
 def send_alive():
     send_info("🟢 KriptoAlper Hayatta")
@@ -472,21 +483,27 @@ def send_status(scanned, sig_count, last_sig_ts):
     )
 
 def maybe_alive_and_status_and_perf():
-    global _last_alive_ts, _last_status_ts, _last_perf_ts, scanned_total, scanned_effective, skipped_cooldown
+    global _last_alive_ts, _last_status_ts, _last_perf_ts, _last_detail_ts
+    global scanned_total, scanned_effective, skipped_cooldown
     now = time.time()
     if now - _last_alive_ts >= ALIVE_MIN * 60:
-        send_alive()
-        _last_alive_ts = now
+        send_alive(); _last_alive_ts = now
     if now - _last_status_ts >= STATUS_MIN * 60:
         send_status(scanned_total, perf_sent_total, _last_signal_ts)
         _last_status_ts = now
         scanned_total = scanned_effective = skipped_cooldown = 0
     if now - _last_perf_ts >= PERF_SUMMARY_MIN * 60:
         try:
-            send_info(render_summary_text(60))
+            send_info(render_summary_text(180))  # son 180 dk özeti
         except Exception as e:
             print("[PERF MSG ERR]", e)
         _last_perf_ts = now
+    if now - _last_detail_ts >= PERF_DETAIL_MIN * 60:
+        try:
+            send_info(render_detail_text(60, max_rows=40))  # saatlik detay
+        except Exception as e:
+            print("[PERF DETAIL ERR]", e)
+        _last_detail_ts = now
 
 def maybe_silence_alert():
     global _last_signal_ts
@@ -552,15 +569,22 @@ def loop_once():
     if random.random() < 0.02:
         print(f"[DIAG] fetched_ok={fetched_ok}/{len(_universe)}")
 
-    # Gönderim: TF birleştir ve gönder
+    # Gönderim: TF birleştir ve gönder (CONF_MIN filtresi ile)
     for sym, arr in symbol_bucket.items():
         merged = merge_signals_same_symbol(arr)
         if not merged: continue
         for ms in merged:
+            if int(ms.get("conf", 0)) < CONF_MIN:
+                continue  # düşük güveni at
             tf_list = ms.get("tf_list", [ms["tf"]])
             rr = float(ms["rr"])
-            est_min = est_minutes_to_tp(tf_list[0] if isinstance(tf_list, list) else ms["tf"], ms["atr"], abs(ms["tp"]-ms["entry"]))
-            msg = render_message_card(sym, tf_list, ms["side"], ms["entry"], ms["tp"], ms["sl"], rr, ms["conf"], est_min)
+            est_min = est_minutes_to_tp(
+                tf_list[0] if isinstance(tf_list, list) else ms["tf"],
+                ms["atr"], abs(ms["tp"]-ms["entry"])
+            )
+            msg = render_message_card(
+                sym, tf_list, ms["side"], ms["entry"], ms["tp"], ms["sl"], rr, ms["conf"], est_min
+            )
             ok = send_tg_signal_sync(msg)
             if ok:
                 print(f"[DELIVERED] {sym}")
@@ -569,7 +593,7 @@ def loop_once():
                 perf_sent_by_sym[sym] += 1
                 perf_rr_last.append(rr)
                 _last_signal_ts = time.time()
-                # --- performans kaydı (yeni) ---
+                # performans kaydı
                 try:
                     record_signal({
                         "sym": sym, "side": ms["side"], "tf_list": tf_list,
@@ -589,7 +613,7 @@ def main_loop():
     while True:
         t0 = time.time()
         try:
-            # --- açık sinyallerin TP/SL kontrolü (yeni) ---
+            # açık sinyallerin TP/SL kontrolü
             try:
                 evaluate_pending(get_klines_cached)
             except Exception as e:
