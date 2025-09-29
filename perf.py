@@ -1,4 +1,7 @@
 # perf.py — KriptoAlper sinyal performans takibi (state.db uyumlu)
+# - Saatlik detay mesajında sadece KAPANANLARI (TP/SL/AMB/EXPIRED) listeler
+# - Açık (NEW) sinyaller için sadece SAYI verir
+
 import sqlite3, time
 
 DB = sqlite3.connect("state.db", check_same_thread=False)
@@ -92,23 +95,24 @@ def evaluate_pending(get_klines_cached):
 
     return tp_c, sl_c, amb_c, exp_c
 
-def summary_last_minutes(minutes: int = 60):
+def summary_last_minutes(minutes: int = 180):
     now = time.time(); t0 = now - minutes*60
     tot = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=?", (t0,)).fetchone()[0]
     tp  = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=? AND status='TP'", (t0,)).fetchone()[0]
     sl  = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=? AND status='SL'", (t0,)).fetchone()[0]
     amb = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=? AND status='AMB'",(t0,)).fetchone()[0]
+    exp = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=? AND status='EXPIRED'",(t0,)).fetchone()[0]
     open_ = DB.execute("SELECT COUNT(*) FROM signals WHERE ts>=? AND status='NEW'",(t0,)).fetchone()[0]
     succ_rate = (tp / max(1, (tp+sl))) * 100.0
-    return dict(total=tot, tp=tp, sl=sl, open=open_, amb=amb, succ=succ_rate)
+    return dict(total=tot, tp=tp, sl=sl, amb=amb, exp=exp, open=open_, succ=succ_rate)
 
-def render_summary_text(minutes=60):
+def render_summary_text(minutes=180):
     s = summary_last_minutes(minutes)
     return (
         f"📈 Performans — Son {minutes} dk\n"
         f"• Gönderilen: {s['total']}\n"
-        f"• 🎯 TP: {s['tp']}\n"
-        f"• 🛑 SL: {s['sl']}\n"
+        f"• 🎯 TP: {s['tp']}   🛑 SL: {s['sl']}\n"
+        f"• ❔ AMB: {s['amb']}  💤 EXP: {s['exp']}\n"
         f"• ⏳ Açık: {s['open']}\n"
         f"• Başarı: {s['succ']:.0f}%"
     )
@@ -116,25 +120,44 @@ def render_summary_text(minutes=60):
 def render_detail_text(minutes=60, max_rows=40):
     """
     Son 'minutes' içinde atılan sinyallerin detaylı listesi.
-    Uzamayı önlemek için 'max_rows' kadar satır döker.
+    • KAPALI sinyaller (TP/SL/AMB/EXPIRED) tek tek listelenir.
+    • AÇIK sinyaller için sadece adet verilir.
     """
     now = time.time(); t0 = now - minutes*60
+
+    # Kapalılar (detay listelenecek)
     rows = DB.execute("""
         SELECT ts, sym, side, tf, entry, tp, sl, status
         FROM signals
-        WHERE ts>=?
+        WHERE ts>=? AND status IN ('TP','SL','AMB','EXPIRED')
         ORDER BY ts DESC
         LIMIT ?
     """, (t0, int(max_rows))).fetchall()
 
-    if not rows:
-        return f"📋 Detay — Son {minutes} dk: kayıt yok."
+    # Açık sayısı (detay yok)
+    open_count = DB.execute("""
+        SELECT COUNT(*) FROM signals WHERE ts>=? AND status='NEW'
+    """, (t0,)).fetchone()[0]
 
-    lines = [f"📋 Detaylı Rapor — Son {minutes} dk"]
+    header = [
+        f"📋 Detay — Son {minutes} dk",
+    ]
+    if open_count > 0:
+        header.append(f"⏳ Açık (detay verilmez): {open_count} adet")
+
+    if not rows:
+        # Kapalı yoksa, sadece açık sayısı/boş mesaj
+        return "\n".join(header if header else [f"📋 Detay — Son {minutes} dk\nKayıt yok."])
+
+    lines = header
+    # Tatlı emojili satırlar
     for ts, sym, side, tf, entry, tp, sl, status in rows:
-        icon = "🎯" if status=="TP" else "🛑" if status=="SL" else "⏳" if status=="NEW" else "❔"
+        icon = "🎯" if status=="TP" else "🛑" if status=="SL" else "❔" if status=="AMB" else "💤"
         side_txt = "LONG" if side=="LONG" else "SHORT"
-        lines.append(f"{icon} {sym} {side_txt} [{tf}] | Giriş {entry:.6f} | TP {tp:.6f} | SL {sl:.6f} → {status}")
+        lines.append(
+            f"{icon} {sym} {side_txt} [{tf}] • "
+            f"💵 {entry:.6f} → 🎯 {tp:.6f} | 🛑 {sl:.6f} • {status}"
+        )
 
     if len(rows) == max_rows:
         lines.append(f"… (ilk {max_rows} satır gösterildi)")
