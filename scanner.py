@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KriptoAlper Scanner — 1m booster, stricter filters, daily EOD report trigger
-- 1m sadece onay/bonus (tek başına sinyal YOK)
-- Base TF'ler: 5m / 15m / 1h
-- CONF >= 73
-- R:R min: 5m=1.40, 15m=1.50, 1h=1.65
-- Wick filtresi sıkı: 1.10
-- EMA kesişimi tazelik: <= 40 bar
-- Base slope min: 0.0030
-- Cooldown: 90 dk
-- Sinyal kartı: Seçenek 1 (kart stili)
-- Gün sonu raporunu 00:00'da perf.py'den gönderir (Europe/Istanbul)
+KriptoAlper Scanner — safer build (no work-hours filter)
+- CONF_MIN=70
+- TOP_N=10, MIN_24H_USDT_VOL=20M
+- 1m only booster; base TFs: 5m/15m/1h
+- REQUIRE 5m & 15m same direction (1m optional bonus)
+- Stricter thresholds: RR, wick, slope, cross freshness, cooldown 120m
+- Hourly cap (30), circuit breaker, mark-price sanity, correlation brake, 1h EMA200 alignment, daily limit 150
+- Daily EOD report is handled by perf.py (00:00 Europe/Istanbul)
 """
 import os, time, traceback, threading, queue, sqlite3, random
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import pandas as pd
@@ -23,44 +20,56 @@ import requests
 from perf import (
     record_signal,
     evaluate_pending,
-    render_detail_text_daily,  # 00:00'da kullanılacak
+    render_detail_text_daily,  # 00:00'da kullanılır
 )
 
 BOT_NAME = "KriptoAlper"
 
-# ================== Ayarlar ==================
+# ================== Settings ==================
 SEND_TO_TELEGRAM = True
 
-# Alive / Perf (saatlik detay KALDIRILDI; sadece heartbeat ON)
-ALIVE_MIN         = 60     # 1 saatte bir 'KriptoAlper Hayatta'
-SILENCE_ALERT_MIN = 180    # 3 saat sinyal yoksa uyarı
+ALIVE_MIN         = 60       # heartbeat: 1 saatte bir
+SILENCE_ALERT_MIN = 180      # 3 saat sinyal yoksa uyarı
 
-# Gün sonu raporu
-IST_OFFSET = 3 * 3600      # Europe/Istanbul kalıcı UTC+3
-_last_daily_sent_key = None  # "YYYY-MM-DD"
+IST_OFFSET = 3 * 3600        # Europe/Istanbul UTC+3
+_last_daily_sent_key = None  # daily report guard
 
 TOP_N = 10
-MIN_24H_USDT_VOL = 2_000_000
-COOLDOWN_MIN_PER_SYMBOL = 90
+MIN_24H_USDT_VOL = 20_000_000  # 20M USDT
+COOLDOWN_MIN_PER_SYMBOL = 120  # 120 dk
 SCAN_DURING_COOLDOWN = True
 
 TIMEFRAMES = ["1m","5m","15m","1h"]
 BASE_SIGNAL_TFS = {"5m","15m","1h"}
 TF_PRIORITY = ["5m","15m","1h","1m"]
 
-CONF_MIN = 73  # (70 -> 73)
+CONF_MIN = 70
 
 REQ_SLEEP_SEC = 0.18
 KLINES_CACHE_TTL = 20
 MAX_RETRY_429 = 3
 BACKOFF_BASE = 0.8
 
-# ================== HTTP / Binance (Futures + Spot fallback) ==================
+# Hour cap & daily cap
+MAX_SIGNALS_PER_HOUR = 30
+_last_hour_signals = deque()
+DAILY_LIMIT = 150
+_today_key = None
+_daily_count = 0
+
+# Circuit breaker
+SENTRY_LOOKBACK = 12
+SENTRY_SL_TRIP = 8
+SENTRY_COOLDOWN_MIN = 30
+_sentry_sl_hits = deque(maxlen=SENTRY_LOOKBACK)
+_sentry_pause_until = 0.0
+
+# ================== HTTP / Binance ==================
 FAPI_BASES = ["https://fapi.binance.com","https://futures.binance.com"]
 SPOT_BASES = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com"]
 _fapi_idx = 0
 _session = requests.Session()
-_session.headers.update({"User-Agent": f"{BOT_NAME}/stable-v5"})
+_session.headers.update({"User-Agent": f"{BOT_NAME}/safer-v1"})
 http_req_count = 0
 
 def _fapi_base():
@@ -186,7 +195,7 @@ def last_cross_bars(fast, slow):
     bars_ago = len(fast)-1 - idx[-1]
     direction = 1 if (fast.iloc[idx[-1]+1] > slow.iloc[idx[-1]+1]) else -1
     return bars_ago, direction
-def wick_filter_ok(df, lookback=2, wick_body_max=1.10):  # sıkılaştırıldı
+def wick_filter_ok(df, lookback=2, wick_body_max=1.05):
     if len(df) < lookback+1: return True
     for i in range(1, lookback+1):
         o = df["open"].iloc[-i]; c = df["close"].iloc[-i]
@@ -269,11 +278,11 @@ EMA_FAST, EMA_SLOW, EMA_BASE = 12, 26, 200
 RSI_LEN = 14
 ATR_LEN = 14
 ATR_MULT_SL, ATR_MULT_TP = 1.00, 2.20
-WICK_BODY_MAX = 1.10  # sıkı
+WICK_BODY_MAX = 1.05
 BB_LEN = 20
-MIN_RR_BY_TF = {"5m":1.40, "15m":1.50, "1h":1.65}
-BASE_SLOPE_MIN = 0.0030  # sıkı
-MAX_CROSS_BARS = 40      # sıkı
+MIN_RR_BY_TF = {"5m":1.45, "15m":1.55, "1h":1.70}
+BASE_SLOPE_MIN = 0.0032
+MAX_CROSS_BARS = 30
 
 def confidence_score(rr, slope_abs, rsi_now, tf_bonus):
     base = 55 + min(20, max(0.0, (rr-1.3)*10)) + min(10, slope_abs/0.05) + (4 if 45<=rsi_now<=65 else 0) + tf_bonus
@@ -311,28 +320,28 @@ def build_signals_for_tf(df, tf, sym):
     if long_tr and recent_cross_ok and dir_cross==1 and wick_ok and (r_now >= 35):
         entry = c; sl = entry - max(atr_n*ATR_MULT_SL, 1e-9*entry); tp = entry + atr_n*ATR_MULT_TP
         rr = (tp-entry)/max((entry-sl),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.40): push("LONG", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.45): push("LONG", entry, tp, sl, rr)
 
     if short_tr and recent_cross_ok and dir_cross==-1 and wick_ok and (r_now <= 65):
         entry = c; sl = entry + max(atr_n*ATR_MULT_SL, 1e-9*entry); tp = entry - atr_n*ATR_MULT_TP
         rr = (entry-tp)/max((sl-entry),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.40): push("SHORT", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.45): push("SHORT", entry, tp, sl, rr)
 
-    # Breakout (daha sıkı base mesafe)
+    # Breakout (yakın base)
     dist_base = abs(c - base) / max(base, 1e-9)
     if (c > bb_up.iloc[-2]) and (slp > 0 or c > base) and (dist_base <= 0.025) and wick_ok:
         entry = c
         sl = min(df["low"].iloc[-3:-1].min(), entry - max(atr_n*ATR_MULT_SL, 1e-9*entry))
         tp = entry + atr_n*ATR_MULT_TP
         rr = (tp-entry)/max((entry-sl),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.40): push("LONG", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.45): push("LONG", entry, tp, sl, rr)
 
     if (c < bb_lo.iloc[-2]) and (slp < 0 or c < base) and (dist_base <= 0.025) and wick_ok:
         entry = c
         sl = max(df["high"].iloc[-3:-1].max(), entry + max(atr_n*ATR_MULT_SL, 1e-9*entry))
         tp = entry - atr_n*ATR_MULT_TP
         rr = (entry-tp)/max((sl-entry),1e-9)
-        if rr >= MIN_RR_BY_TF.get(tf,1.40): push("SHORT", entry, tp, sl, rr)
+        if rr >= MIN_RR_BY_TF.get(tf,1.45): push("SHORT", entry, tp, sl, rr)
 
     return out
 
@@ -351,25 +360,79 @@ def merge_signals_same_symbol(symbol_sigs):
         group = [s for s in symbol_sigs if s["side"]==side]
         if not group: continue
         base = pick_base_signal(group)
-        if not base: 
-            continue  # 1m tek başına ise at
+        if not base:
+            continue  # 1m tek başına ise gönderme
+
         tfs = sorted({s["tf"] for s in group}, key=lambda x: TF_PRIORITY.index(x) if x in TF_PRIORITY else 99)
-        tf_bonus = min(12, 3 + 3*(len(tfs)-1))  # 1m bonus getirir
+
+        # ZORUNLU: 5m ve 15m birlikte onaylasın
+        if not (("5m" in tfs) and ("15m" in tfs)):
+            continue
+
+        # TF bonus (1m dahil bonus olarak sayılır)
+        tf_bonus = min(12, 3 + 3*(len(tfs)-1))
         conf = confidence_score(base["rr"], abs(base["slope"]), base["rsi"], tf_bonus)
         base2 = base.copy(); base2["tf_list"] = tfs; base2["conf"] = conf
         out.append(base2)
     return out
 
-# ================== Message format (Seçenek 1 - Kart) ==================
+# ================== Message format (Card + Leverage line) ==================
 def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf):
     tf_text = "/".join(tf_list) if isinstance(tf_list, list) else str(tf_list)
+    lev = leverage_for_conf(int(conf))
     return (
         f"📌 {sym} · {'LONG' if side=='LONG' else 'SHORT'} [{tf_text}]\n"
         f"💵 Entry: {_fmt_price(entry)}\n"
         f"🎯 TP: {_fmt_price(tp)}\n"
         f"🛑 SL: {_fmt_price(sl)}\n"
-        f"⚡ Güven: {int(conf)}"
+        f"⚡ Güven: {int(conf)}\n"
+        f"🧰 Önerilen kaldıraç: {lev}x"
     )
+
+# ================== Guards (hour cap / daily cap / breaker) ==================
+def _hour_quota_ok():
+    now = time.time()
+    while _last_hour_signals and now - _last_hour_signals[0] > 3600:
+        _last_hour_signals.popleft()
+    return len(_last_hour_signals) < MAX_SIGNALS_PER_HOUR
+
+def _hour_quota_mark():
+    _last_hour_signals.append(time.time())
+
+def _reset_daily_if_needed():
+    global _today_key, _daily_count
+    t = time.gmtime(time.time()+IST_OFFSET)
+    key = f"{t.tm_year:04d}-{t.tm_mon:02d}-{t.tm_mday:02d}"
+    if key != _today_key:
+        _today_key = key
+        _daily_count = 0
+
+def _daily_ok():
+    _reset_daily_if_needed()
+    return _daily_count < DAILY_LIMIT
+
+def _daily_mark():
+    globals()['_daily_count'] += 1
+
+def _sentry_update(last_status):  # "TP"/"SL"/"AMB"/"EXPIRED"
+    global _sentry_pause_until
+    _sentry_sl_hits.append(1 if last_status=="SL" else 0)
+    if sum(_sentry_sl_hits) >= SENTRY_SL_TRIP:
+        _sentry_pause_until = time.time() + SENTRY_COOLDOWN_MIN*60
+        _sentry_sl_hits.clear()
+
+def _sentry_active():
+    return time.time() < _sentry_pause_until
+
+# ================== Mark price sanity ==================
+def get_mark_price(symbol):
+    r = http_get(f"{_fapi_base()}/fapi/v1/premiumIndex", params={"symbol":symbol})
+    if r and r.status_code==200:
+        try:
+            return float(r.json().get("markPrice"))
+        except:
+            return None
+    return None
 
 # ================== Alive & Daily report ==================
 _last_alive_ts = 0.0
@@ -388,26 +451,24 @@ def maybe_send_daily_report():
     global _last_daily_sent_key
     now = time.time()
     key_now = istanbul_day_key(now)
-    # 00:00-00:05 aralığında dünün raporunu gönder
     loc = now + IST_OFFSET
     t = time.gmtime(loc)
     if t.tm_hour == 0 and t.tm_min < 5:
-        # dünkü gün anahtarı
-        # gece 00:00'da yeni gün başladı, rapor bir önceki güne ait
-        # dünün key'i:
         yesterday_ts = now - 86400
-        ykey = istanbul_day_key(yesterday_ts)
-        if _last_daily_sent_key != key_now:  # aynı gün içinde bir kez
+        if _last_daily_sent_key != key_now:
             try:
-                text = render_detail_text_daily(yesterday_ts)  # perf.py
+                text = render_detail_text_daily(yesterday_ts)
                 send_info(text)
             except Exception as e:
                 print("[DAILY ERR]", e)
             _last_daily_sent_key = key_now
 
-# ================== Main loop ==================
+# ================== Main ==================
 def loop_once():
     global _last_signal_ts, _universe, _last_universe_ts
+    if _sentry_active():
+        return  # breaker aktifken üretme
+
     if (time.time() - _last_universe_ts) >= 120 or not _universe:
         _universe = refresh_top_futures(TOP_N); _last_universe_ts = time.time()
 
@@ -422,55 +483,91 @@ def loop_once():
         if df1m is None or len(df1m) < 60:
             continue
 
-        # 1m dahil tüm TF’lerde hesapla (1m sadece destek)
         for tf in TIMEFRAMES:
             df = df1m if tf=="1m" else get_klines_cached(sym, tf, 250)
             sigs = build_signals_for_tf(df, tf, sym)
             if not sigs: continue
             symbol_bucket[sym].extend(sigs)
 
-    # Gönderim
     for sym, arr in symbol_bucket.items():
         merged = merge_signals_same_symbol(arr)
         if not merged: continue
+
+        # Korelasyon freni: aynı anda aynı yönde en yüksek 10'u seç
+        by_side = defaultdict(list)
         for ms in merged:
-            if int(ms.get("conf",0)) < CONF_MIN:
-                continue
-            msg = render_message_card(sym, ms.get("tf_list",[ms["tf"]]), ms["side"], ms["entry"], ms["tp"], ms["sl"], float(ms["rr"]), ms["conf"])
-            if send_tg_signal_sync(msg):
-                mark_sent(sym)
-                _last_signal_ts = time.time()
-                try:
-                    record_signal({
-                        "sym": sym, "side": ms["side"], "tf_list": ms.get("tf_list",[ms["tf"]]),
-                        "entry": ms["entry"], "sl": ms["sl"], "tp": ms["tp"],
-                        "rr": float(ms["rr"]), "conf": int(ms["conf"])
-                    })
-                except Exception as e:
-                    print("[PERF REC ERR]", e)
+            by_side[ms["side"]].append(ms)
+
+        for side, arr_side in by_side.items():
+            arr_side.sort(key=lambda x: int(x["conf"]), reverse=True)
+            keep = arr_side[:10]  # aynı anda maksimum 10
+            for ms in keep:
+                if int(ms.get("conf",0)) < CONF_MIN:
+                    continue
+
+                # 1h trend uyumu (EMA200)
+                dfh = get_klines_cached(sym, "1h", 120)
+                if dfh is not None and len(dfh)>50:
+                    ema200 = ema(dfh["close"], 200).iloc[-2]
+                    c1h = dfh["close"].iloc[-2]
+                    if (ms["side"]=="LONG" and c1h < ema200) or (ms["side"]=="SHORT" and c1h > ema200):
+                        continue
+
+                # Mark price sanity (%2)
+                mk = get_mark_price(sym)
+                if mk:
+                    px = float(ms["entry"])
+                    if abs(px - mk)/mk > 0.02:
+                        continue
+
+                # Rate limits
+                if not _hour_quota_ok() or not _daily_ok():
+                    continue
+
+                msg = render_message_card(sym, ms.get("tf_list",[ms["tf"]]), ms["side"], ms["entry"], ms["tp"], ms["sl"], float(ms["rr"]), ms["conf"])
+                if send_tg_signal_sync(msg):
+                    mark_sent(sym)
+                    _hour_quota_mark(); _daily_mark()
+                    _last_signal_ts = time.time()
+                    try:
+                        record_signal({
+                            "sym": sym, "side": ms["side"], "tf_list": ms.get("tf_list",[ms["tf"]]),
+                            "entry": ms["entry"], "sl": ms["sl"], "tp": ms["tp"],
+                            "rr": float(ms["rr"]), "conf": int(ms["conf"])
+                        })
+                    except Exception as e:
+                        print("[PERF REC ERR]", e)
 
 def main_loop():
-    print("KriptoAlper scanner (stricter + daily EOD) started.")
+    print("KriptoAlper scanner (safer) started.")
     send_info("🟢 KriptoAlper çalışıyor.")
     send_alive()
     while True:
         t0 = time.time()
         try:
             try:
-                evaluate_pending(get_klines_cached)
+                tp_c, sl_c, amb_c, exp_c = evaluate_pending(get_klines_cached)
+                for _ in range(sl_c): _sentry_update("SL")
+                for _ in range(tp_c): _sentry_update("TP")
+                for _ in range(amb_c): _sentry_update("AMB")
+                for _ in range(exp_c): _sentry_update("EXPIRED")
             except Exception as e:
                 print("[PERF EVAL ERR]", e)
 
             loop_once()
-            # Heartbeat
+
+            # heartbeat
+            global _last_alive_ts
             if time.time() - _last_alive_ts >= ALIVE_MIN*60:
                 send_alive()
-                globals()['_last_alive_ts'] = time.time()
-            # Sessizlik uyarısı
+                _last_alive_ts = time.time()
+
+            # sessizlik uyarısı
             if _last_signal_ts and (time.time() - _last_signal_ts) >= SILENCE_ALERT_MIN*60:
                 send_info(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok.")
                 _last_signal_ts = time.time()
-            # Gün sonu raporu (00:00)
+
+            # günlük rapor
             maybe_send_daily_report()
 
         except Exception as e:
@@ -482,4 +579,3 @@ def main():
 
 if __name__ == "__main__":
     main_loop()
-
