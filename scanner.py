@@ -39,7 +39,7 @@ SILENCE_ALERT_MIN = 180    # 3 saat sinyal yoksa uyarı
 IST_OFFSET = 3 * 3600      # Europe/Istanbul kalıcı UTC+3
 _last_daily_sent_key = None  # "YYYY-MM-DD"
 
-TOP_N = 30
+TOP_N = 10
 MIN_24H_USDT_VOL = 2_000_000
 COOLDOWN_MIN_PER_SYMBOL = 90
 SCAN_DURING_COOLDOWN = True
@@ -482,3 +482,4 @@ def main():
 
 if __name__ == "__main__":
     main_loop()
+
