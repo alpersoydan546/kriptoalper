@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KriptoAlper Scanner — safer sticky build (no work-hours filter)
-- CONF_MIN=70
-- TOP_N=10, min 24h vol=20M
-- 1m sadece booster; base TF: 5m/15m/1h
-- 5m & 15m aynı yönde zorunlu
-- Eşikler sık: RR (1.45/1.55/1.70), wick 1.05, slope 0.0032, cross<=30 bar
-- Cooldown 120 dk (ek), fakat asıl tekrar koruması: STICKY SIGNAL (imzaya bağlı)
+KriptoAlper Scanner — sticky + re-entry + meta heartbeat + predictive filter
+- CONF_MIN = 70
+- TOP_N = 10 (24h vol >= 20M USDT)
+- 1m sadece booster; ana TF: 5m/15m/1h (5m & 15m birlikte ZORUNLU)
+- Sıkı eşikler: RR (5m:1.45, 15m:1.55, 1h:1.70), wick 1.05, slope 0.0032, cross<=30 bar
+- Sticky (imza tabanlı) tekrar önleme + 30 dk grace
+- Re-entry freni: aynı (sym, side) 30 dk içinde küçük farkı atla (ATR ve CONF)
+- DB tabanlı heartbeat/sessizlik kontrolü (persist)
+- Predictive filter: P(TP) + EV eşiği (Wilson lower bound + conf karışımı)
 - Rate limits: 30/saat, 150/gün; circuit breaker; mark price sanity (%2)
 - 1h EMA200 trend uyumu; korelasyon freni
-- Sinyal mesajında “Önerilen kaldıraç: Nx” satırı
-- Gün sonu raporu 00:00'da perf.py üzerinden
+- Mesajda “🧰 Önerilen kaldıraç: Nx”
+- Gün sonu raporu 00:00'da (perf.py)
 """
-import os, time, traceback, threading, queue, sqlite3
+import os, time, traceback, threading, queue, sqlite3, math
 from collections import defaultdict, deque
 
 import numpy as np
@@ -22,19 +24,17 @@ import requests
 
 from perf import (
     record_signal,
-    evaluate_pending,
+    evaluate_pending,          # evaluate_pending(get_klines_cached, return_closed_sigkeys=True)
     render_detail_text_daily,
 )
 
 BOT_NAME = "KriptoAlper"
 
 # ================== Settings ==================
-SEND_TO_TELEGRAM = True
-
-ALIVE_MIN         = 60       # heartbeat
-SILENCE_ALERT_MIN = 180      # 3 saat sessizlik uyarısı
-
-IST_OFFSET = 3 * 3600
+SEND_TO_TELEGRAM   = True
+ALIVE_MIN          = 60    # heartbeat: 1 saatte bir
+SILENCE_ALERT_MIN  = 180   # 3 saat sinyal yoksa uyar
+IST_OFFSET         = 3 * 3600
 _last_daily_sent_key = None
 
 TOP_N = 10
@@ -48,12 +48,12 @@ TF_PRIORITY = ["5m","15m","1h","1m"]
 
 CONF_MIN = 70
 
-REQ_SLEEP_SEC = 0.18
-KLINES_CACHE_TTL = 20
-MAX_RETRY_429 = 3
-BACKOFF_BASE = 0.8
+REQ_SLEEP_SEC     = 0.18
+KLINES_CACHE_TTL  = 20
+MAX_RETRY_429     = 3
+BACKOFF_BASE      = 0.8
 
-# hour/daily caps
+# limits
 MAX_SIGNALS_PER_HOUR = 30
 _last_hour_signals = deque()
 DAILY_LIMIT = 150
@@ -66,6 +66,17 @@ SENTRY_SL_TRIP = 8
 SENTRY_COOLDOWN_MIN = 30
 _sentry_sl_hits = deque(maxlen=SENTRY_LOOKBACK)
 _sentry_pause_until = 0.0
+
+# re-entry guard
+REENTRY_MIN_MIN   = 30     # 30 dk
+REENTRY_PX_ATR    = 0.6    # entry farkı >= 0.6*ATR değilse küçük fark say
+REENTRY_CONF_UP   = 10     # güven +10 yoksa küçük upgrade say
+
+# predictive filter (tahmin)
+WIN_LOOKBACK_DAYS = 7      # son 7 gün
+WIN_MIN_SIGNALS   = 25     # minimum örnek
+PTP_THRESHOLD     = 0.60   # P(TP) alt sınır
+EV_MIN_R          = 0.20   # en az +0.2R beklenen değer
 
 # ================== HTTP / Binance ==================
 FAPI_BASES = ["https://fapi.binance.com","https://futures.binance.com"]
@@ -104,7 +115,7 @@ def http_get_spot(path, params=None, timeout=10):
             pass
     return None
 
-# ================== DB (cooldown + sticky) ==================
+# ================== DB (cooldown + sticky + meta + re-entry) ==================
 DB_PATH = "state.db"
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute("CREATE TABLE IF NOT EXISTS cooldown (sym TEXT PRIMARY KEY, ts REAL)")
@@ -114,6 +125,18 @@ _db.execute("""CREATE TABLE IF NOT EXISTS active_signals(
   last_ts REAL,
   conf INT,
   status TEXT
+)""")
+_db.execute("""CREATE TABLE IF NOT EXISTS meta(
+  k TEXT PRIMARY KEY,
+  v REAL
+)""")
+_db.execute("""CREATE TABLE IF NOT EXISTS recent_sends(
+  sym TEXT,
+  side TEXT,
+  ts REAL,
+  entry REAL,
+  conf INT,
+  PRIMARY KEY(sym, side)
 )""")
 _db.commit()
 
@@ -126,31 +149,43 @@ def mark_sent(sym: str):
     _db.execute("INSERT OR REPLACE INTO cooldown(sym, ts) VALUES (?,?)", (sym, time.time()))
     _db.commit()
 
+def meta_get(k, default=0.0):
+    row = _db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+    return float(row[0]) if row else default
+
+def meta_set(k, v):
+    _db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)", (k, float(v)))
+    _db.commit()
+
 # ---------- sticky helpers ----------
 def _round_px(x: float) -> float:
-    if x >= 1: return round(x, 5)
-    return round(x, 8)
+    # daha kaba bucket: küçük titreşimler yeni imza üretmesin
+    if x >= 100: return round(x, 2)   # 2 ondalık
+    if x >= 1:  return round(x, 4)    # 4 ondalık
+    return round(x, 7)
 
 def make_sig_key(sym, side, tf_list, entry, tp, sl):
-    tf_key = "/".join(sorted(tf_list))
+    # 1m sadece booster; imzadan hariç
+    base_tfs = sorted([t for t in tf_list if t != "1m"])
+    if not base_tfs:
+        base_tfs = ["5m","15m"]
+    tf_key = "/".join(base_tfs)
     return f"{sym}|{side}|{tf_key}|{_round_px(entry)}|{_round_px(tp)}|{_round_px(sl)}"
 
-def sticky_allowed(sig_key, new_conf, tf_list_changed=False, entry=None, tp=None, sl=None, atr=None):
-    row = _db.execute("SELECT conf,status FROM active_signals WHERE sig_key=?", (sig_key,)).fetchone()
-    if not row:  # ilk defa
+STICKY_GRACE_MIN = 30  # aynı imza açıkken 30 dk boyunca tekrar yok
+
+def sticky_allowed(sig_key, new_conf):
+    row = _db.execute("SELECT conf,status,last_ts FROM active_signals WHERE sig_key=?", (sig_key,)).fetchone()
+    if not row:
         return True
-    old_conf, status = int(row[0]), row[1]
+    old_conf, status, last_ts = int(row[0]), row[1], float(row[2]) if row[2] is not None else 0.0
     if status != "OPEN":
         return True
-    # aynı imza açıkken tekrar göndermemek:
-    # yalnızca anlamlı değişimde izin (opsiyonel kriterler)
-    if new_conf >= old_conf + 7:
-        return True
-    if tf_list_changed:
-        return True
-    if atr and entry is not None:
-        return True
-    return False
+    # 30 dk grace: yalnızca büyük upgrade olursa izin
+    if time.time() - last_ts < STICKY_GRACE_MIN * 60:
+        return new_conf >= old_conf + 10
+    # 30 dk geçtiyse küçük farklara yine izin verme
+    return new_conf >= old_conf + 7
 
 def sticky_mark_open(sig_key, conf):
     ts = time.time()
@@ -161,6 +196,25 @@ def sticky_mark_open(sig_key, conf):
 def sticky_mark_closed(sig_key):
     _db.execute("UPDATE active_signals SET status='CLOSED', last_ts=? WHERE sig_key=?",
                 (time.time(), sig_key))
+    _db.commit()
+
+# ---------- re-entry guard ----------
+def reentry_allowed(sym, side, entry_now, conf_now, atr_val):
+    row = _db.execute("SELECT ts, entry, conf FROM recent_sends WHERE sym=? AND side=?", (sym, side)).fetchone()
+    if not row:
+        return True
+    last_ts, last_entry, last_conf = float(row[0]), float(row[1]), int(row[2])
+    if time.time() - last_ts >= REENTRY_MIN_MIN*60:
+        return True
+    big_conf = conf_now >= last_conf + REENTRY_CONF_UP
+    big_move = False
+    if atr_val and float(atr_val) > 0:
+        big_move = abs(float(entry_now) - last_entry) >= (REENTRY_PX_ATR * float(atr_val))
+    return big_conf or big_move
+
+def reentry_mark(sym, side, entry_now, conf_now):
+    _db.execute("INSERT OR REPLACE INTO recent_sends(sym,side,ts,entry,conf) VALUES (?,?,?,?,?)",
+                (sym, side, time.time(), float(entry_now), int(conf_now)))
     _db.commit()
 
 # ================== Telegram ==================
@@ -254,9 +308,9 @@ def wick_filter_ok(df, lookback=2, wick_body_max=1.05):
 
 # ================== helpers ==================
 def _fmt_price(x: float):
-    if x >= 100: return f"{x:,.3f}".replace(","," ")
-    if x >= 1:  return f"{x:,.5f}".replace(","," ")
-    return f"{x:.8f}".rstrip("0").rstrip(".")
+    if x >= 100: return f"{x:,.2f}".replace(","," ")
+    if x >= 1:  return f"{x:,.4f}".replace(","," ")
+    return f"{x:.7f}".rstrip("0").rstrip(".")
 def leverage_for_conf(conf: int) -> int:
     return 12 if conf>=90 else 9 if conf>=80 else 7 if conf>=70 else 5 if conf>=60 else 3
 
@@ -415,13 +469,61 @@ def merge_signals_same_symbol(symbol_sigs):
         if not (("5m" in tfs) and ("15m" in tfs)):
             continue
 
-        tf_bonus = min(12, 3 + 3*(len(tfs)-1))  # 1m de bonus sayılır
+        tf_bonus = min(12, 3 + 3*(len(tfs)-1))  # 1m bonus sayılır
         conf = confidence_score(base["rr"], abs(base["slope"]), base["rsi"], tf_bonus)
         base2 = base.copy(); base2["tf_list"] = tfs; base2["conf"] = conf
         out.append(base2)
     return out
 
-# ================== Msg format ==================
+# ================== predictive helpers (P(TP) & EV) ==================
+def _ist_range_days(days: int):
+    now = time.time()
+    start = now - days*86400
+    return start, now
+
+def wilson_lower_bound(success, total, z=1.2816):  # ~%80 güven
+    if total <= 0: return 0.0
+    phat = success / total
+    denom = 1 + z*z/total
+    centre = phat + z*z/(2*total)
+    margin = z * math.sqrt((phat*(1-phat) + z*z/(4*total)) / total)
+    return max(0.0, (centre - margin) / denom)
+
+def recent_winrate(sym: str, side: str, tf_key: str):
+    start_ts, end_ts = _ist_range_days(WIN_LOOKBACK_DAYS)
+    # toplam
+    row = _db.execute("""
+        SELECT COUNT(*) FROM signals
+        WHERE ts BETWEEN ? AND ? AND sym=? AND side=? AND tf LIKE ?
+    """, (start_ts, end_ts, sym, side, f"%{tf_key}%")).fetchone()
+    total = int(row[0]) if row else 0
+    if total == 0:
+        return 0.0, 0
+    # TP sayısı
+    row2 = _db.execute("""
+        SELECT COUNT(*) FROM signals
+        WHERE ts BETWEEN ? AND ? AND sym=? AND side=? AND tf LIKE ? AND status='TP'
+    """, (start_ts, end_ts, sym, side, f"%{tf_key}%")).fetchone()
+    tp_cnt = int(row2[0]) if row2 else 0
+    wr_wlb = wilson_lower_bound(tp_cnt, total, z=1.2816)
+    return wr_wlb, total
+
+def ptp_estimate(sym, side, tf_list, conf_int):
+    base_tfs = sorted([t for t in tf_list if t != "1m"])
+    tf_key = "/".join(base_tfs) if base_tfs else "5m/15m"
+    wr_wlb, n = recent_winrate(sym, side, tf_key)
+    alpha = 0.6 if n >= WIN_MIN_SIGNALS else 0.3
+    ptp = alpha*wr_wlb + (1-alpha)*(conf_int/100.0)
+    return ptp, wr_wlb, n
+
+# ================== Message format ==================
+def _fmt_price(x: float):
+    if x >= 100: return f"{x:,.2f}".replace(","," ")
+    if x >= 1:  return f"{x:,.4f}".replace(","," ")
+    return f"{x:.7f}".rstrip("0").rstrip(".")
+def leverage_for_conf(conf: int) -> int:
+    return 12 if conf>=90 else 9 if conf>=80 else 7 if conf>=70 else 5 if conf>=60 else 3
+
 def render_message_card(sym, tf_list, side, entry, tp, sl, rr, conf):
     tf_text = "/".join(tf_list) if isinstance(tf_list, list) else str(tf_list)
     lev = leverage_for_conf(int(conf))
@@ -472,7 +574,12 @@ _last_alive_ts = 0.0
 _last_signal_ts = None
 
 def send_alive():
+    # DB tabanlı throttle (restart olsa bile saatte 1)
+    last = meta_get("last_alive_ts", 0.0)
+    if time.time() - last < ALIVE_MIN*60:
+        return
     send_info("🟢 KriptoAlper Hayatta")
+    meta_set("last_alive_ts", time.time())
 
 def istanbul_day_key(ts=None):
     if ts is None: ts = time.time()
@@ -552,22 +659,41 @@ def loop_once():
                     if abs(px - mk)/mk > 0.02:
                         continue
 
-                # Sticky signature (duplicate önleme)
+                # Sticky signature (duplicate önleme) — 1m imzadan hariç
                 tf_list = ms.get("tf_list",[ms["tf"]])
                 sig_key = make_sig_key(sym, ms["side"], tf_list, ms["entry"], ms["tp"], ms["sl"])
                 if not sticky_allowed(sig_key, int(ms["conf"])):
+                    continue
+
+                # Re-entry guard (aynı sym+side 30 dk içinde önemsiz değişiklik)
+                if not reentry_allowed(sym, ms["side"], float(ms["entry"]), int(ms["conf"]), ms.get("atr")):
                     continue
 
                 # Rate limits
                 if not _hour_quota_ok() or not _daily_ok():
                     continue
 
+                # === Predictive filter: P(TP) & EV ===
+                # TF anahtarı (1m hariç)
+                base_tfs = sorted([t for t in tf_list if t != "1m"])
+                tf_key = "/".join(base_tfs) if base_tfs else "5m/15m"
+                ptp, wr_wlb, n_samp = ptp_estimate(sym, ms["side"], tf_list, int(ms["conf"]))
+                risk = abs(float(ms["entry"]) - float(ms["sl"]))
+                reward = abs(float(ms["tp"]) - float(ms["entry"]))
+                R = (reward / max(risk, 1e-9))
+                EV = ptp*R - (1 - ptp)*1.0
+                if not (ptp >= PTP_THRESHOLD and EV >= EV_MIN_R):
+                    # print(f"[FILTERED] {sym} {ms['side']} tf={tf_key} ptp={ptp:.2f} wr*={wr_wlb:.2f} n={n_samp} EV={EV:.2f}")
+                    continue
+
                 msg = render_message_card(sym, tf_list, ms["side"], ms["entry"], ms["tp"], ms["sl"], float(ms["rr"]), ms["conf"])
                 if send_tg_signal_sync(msg):
+                    reentry_mark(sym, ms["side"], float(ms["entry"]), int(ms["conf"]))
                     sticky_mark_open(sig_key, int(ms["conf"]))
                     mark_sent(sym)
                     _hour_quota_mark(); _daily_mark()
                     _last_signal_ts = time.time()
+                    meta_set("last_signal_ts", _last_signal_ts)
                     try:
                         record_signal({
                             "sym": sym, "side": ms["side"], "tf_list": tf_list,
@@ -578,8 +704,8 @@ def loop_once():
                         print("[PERF REC ERR]", e)
 
 def main_loop():
-    global _last_signal_ts  # <<< UnboundLocalError fix
-    print("KriptoAlper scanner (safer+sticky) started.")
+    global _last_signal_ts  # UnboundLocalError fix
+    print("KriptoAlper scanner (sticky+reentry+predictive) started.")
     send_info("🟢 KriptoAlper çalışıyor.")
     send_alive()
     while True:
@@ -599,16 +725,14 @@ def main_loop():
 
             loop_once()
 
-            # heartbeat
-            global _last_alive_ts
-            if time.time() - _last_alive_ts >= ALIVE_MIN*60:
-                send_alive()
-                _last_alive_ts = time.time()
+            # heartbeat (DB throttle)
+            send_alive()
 
-            # sessizlik uyarısı
-            if _last_signal_ts and (time.time() - _last_signal_ts) >= SILENCE_ALERT_MIN*60:
+            # sessizlik uyarısı (DB kontrollü)
+            last_sig = meta_get("last_signal_ts", 0.0)
+            if last_sig and (time.time() - last_sig) >= SILENCE_ALERT_MIN*60:
                 send_info(f"🟡 {SILENCE_ALERT_MIN}+ dk sinyal yok.")
-                _last_signal_ts = time.time()
+                meta_set("last_signal_ts", time.time())
 
             # günlük rapor
             maybe_send_daily_report()
