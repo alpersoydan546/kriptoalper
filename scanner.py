@@ -1,177 +1,156 @@
-import os
 import time
-import math
 import requests
-from datetime import datetime, timezone
-from collections import defaultdict
+import threading
+import math
+import os
+from datetime import datetime
 
-# ==========================
-# AYARLAR
-# ==========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-BINANCE_FUTURES = "https://fapi.binance.com"
-
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
-    "XRPUSDT", "DOGEUSDT", "AVAXUSDT"
+# =========================
+# CONFIG
+# =========================
+BINANCE_FAPI = "https://fapi.binance.com"
+SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+    "DOGEUSDT","AVAXUSDT","ADAUSDT","LINKUSDT","OPUSDT",
+    "ARBUSDT","ATOMUSDT","DOTUSDT","NEARUSDT","APTUSDT"
 ]
 
-TIMEFRAMES = ["5m", "15m", "1h"]
-
+INTERVALS = ["5m", "15m"]
 CONF_MIN = 70
-COOLDOWN_MIN = 30          # Aynı coin için tekrar sinyal süresi
-SCAN_INTERVAL = 60         # 1 dk
-RECOMMENDED_LEVERAGE = "7x"
+SCAN_SLEEP = 60        # her 1 dk tarama
+HEARTBEAT_MIN = 30     # 30 dk hayattayım
 
-_last_signal_time = defaultdict(lambda: 0)
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
-# ==========================
-# YARDIMCI FONKSİYONLAR
-# ==========================
+# =========================
+# STATE
+# =========================
+last_heartbeat = 0
+
+# =========================
+# UTILS
+# =========================
 def tg_send(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    requests.post(url, json=payload, timeout=10)
-
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TG_CHAT,
+            "text": text
+        }, timeout=10)
+    except:
+        pass
 
 def get_klines(symbol, interval, limit=100):
-    url = f"{BINANCE_FUTURES}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    r = requests.get(url, params={
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }, timeout=10)
     return r.json()
 
-
-def ema(values, period):
-    k = 2 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
-
-
-def rsi(values, period=14):
+def rsi(closes, period=14):
     gains, losses = [], []
-    for i in range(1, period + 1):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period if sum(losses) != 0 else 1e-9
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    if len(gains) < period:
+        return 50
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
-# ==========================
-# GÜVEN SKORU
-# ==========================
-def calc_confidence(closes):
-    score = 50
-
-    ema50 = ema(closes[-50:], 50)
-    ema200 = ema(closes[-200:], 200)
-    rsi14 = rsi(closes[-15:], 14)
-
-    if ema50 > ema200:
-        score += 10
-    else:
-        score -= 10
-
-    if 45 < rsi14 < 65:
-        score += 10
-    else:
-        score -= 5
-
-    volatility = abs(closes[-1] - closes[-5]) / closes[-5]
-    if volatility < 0.01:
-        score += 5
-
-    return max(0, min(100, score))
-
-
-# ==========================
-# FORMAT (SENİN SEÇTİĞİN)
-# ==========================
-def format_signal(symbol, side, tf_list, entry, tp, sl, confidence):
-    tf_txt = "/".join(tf_list)
-    return (
-        f"📌 {symbol} · {side} [{tf_txt}]\n"
-        f"💵 Entry: {entry:.5f}\n"
-        f"🎯 TP: {tp:.5f}\n"
-        f"🛑 SL: {sl:.5f}\n"
-        f"⚡ Güven: {confidence}\n"
-        f"🧰 Önerilen kaldıraç: {RECOMMENDED_LEVERAGE}"
-    )
-
-
-# ==========================
-# ANA SİNYAL MANTIĞI
-# ==========================
+# =========================
+# SIGNAL LOGIC
+# =========================
 def analyze(symbol):
-    closes_by_tf = {}
-    for tf in TIMEFRAMES:
+    score = 0
+    directions = []
+
+    for tf in INTERVALS:
         kl = get_klines(symbol, tf)
-        closes_by_tf[tf] = [float(k[4]) for k in kl]
+        closes = [float(x[4]) for x in kl]
+        r = rsi(closes)
 
-    conf_scores = []
-    for tf in TIMEFRAMES:
-        conf_scores.append(calc_confidence(closes_by_tf[tf]))
+        if r > 55:
+            score += 10
+            directions.append("LONG")
+        elif r < 45:
+            score += 10
+            directions.append("SHORT")
 
-    confidence = int(sum(conf_scores) / len(conf_scores))
-    if confidence < CONF_MIN:
+    if len(set(directions)) != 1:
         return None
 
-    now = time.time()
-    if now - _last_signal_time[symbol] < COOLDOWN_MIN * 60:
+    direction = directions[0]
+    score += 50  # trend uyumu bonus
+
+    if score < CONF_MIN:
         return None
 
-    price = closes_by_tf["5m"][-1]
-
-    # YÖN
-    side = "LONG" if conf_scores.count(max(conf_scores)) >= 2 else "SHORT"
-
-    if side == "LONG":
-        sl = price * 0.99
-        tp = price * 1.02
+    price = float(closes[-1])
+    if direction == "LONG":
+        tp = price * 1.006
+        sl = price * 0.996
     else:
-        sl = price * 1.01
-        tp = price * 0.98
+        tp = price * 0.994
+        sl = price * 1.004
 
-    _last_signal_time[symbol] = now
+    return {
+        "symbol": symbol,
+        "dir": direction,
+        "price": price,
+        "tp": tp,
+        "sl": sl,
+        "conf": score
+    }
 
-    return format_signal(
-        symbol,
-        side,
-        TIMEFRAMES,
-        price,
-        tp,
-        sl,
-        confidence
-    )
-
-
-# ==========================
-# LOOP
-# ==========================
-def main_loop():
+# =========================
+# MAIN LOOP
+# =========================
+def scanner_loop():
+    global last_heartbeat
     tg_send("🟢 KriptoAlper Hayatta")
 
     while True:
-        try:
-            for symbol in PAIRS:
-                msg = analyze(symbol)
-                if msg:
-                    tg_send(msg)
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            print("ERR:", e)
-            time.sleep(10)
+        now = time.time()
 
+        # HEARTBEAT
+        if now - last_heartbeat >= HEARTBEAT_MIN * 60:
+            tg_send("🟢 KriptoAlper Hayatta")
+            last_heartbeat = now
 
-if __name__ == "__main__":
-    main_loop()
+        for sym in SYMBOLS:
+            try:
+                sig = analyze(sym)
+                if not sig:
+                    continue
+
+                msg = (
+                    f"📌 {sig['symbol']} | {sig['dir']} | 5m/15m\n"
+                    f"💵 Giriş: {sig['price']:.6f}\n"
+                    f"🎯 TP: {sig['tp']:.6f}\n"
+                    f"🛑 SL: {sig['sl']:.6f}\n"
+                    f"⚡ Güven: {sig['conf']}\n"
+                    f"🧰 Kaldıraç: 7x"
+                )
+                tg_send(msg)
+                time.sleep(5)
+
+            except Exception as e:
+                continue
+
+        time.sleep(SCAN_SLEEP)
+
+def start_scanner():
+    t = threading.Thread(target=scanner_loop, daemon=True)
+    t.start()
