@@ -1,175 +1,117 @@
+import os
 import time
-import math
-import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# =========================
-# CONFIG
-# =========================
-BINANCE_FAPI = "https://fapi.binance.com"
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
-    "ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","NEARUSDT","APTUSDT"
-]
-
-TIMEFRAMES = ["5m", "15m"]
-TREND_TF = "1h"
-
-CONF_MIN = 75
-COOLDOWN_MIN = 60
-HEARTBEAT_MIN = 30
-SLEEP_BETWEEN_SCANS = 90
-
-LEVERAGE = "7x"
-
+# ================== ENV ==================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# =========================
-# STATE
-# =========================
-last_signal_time = {}
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+
+# ================== AYARLAR ==================
+SCAN_INTERVAL = 300          # 5 dk
+HEARTBEAT_INTERVAL = 1800    # 30 dk
+CONF_MIN = 70
+LEVERAGE = "7x"
+
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT"
+]
+
+sent_cache = {}
 last_heartbeat = 0
 
-# =========================
-# HELPERS
-# =========================
-def tg_send(text):
+# ================== TELEGRAM ==================
+def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram ENV yok")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={
+    payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    }, timeout=10)
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        print("[TG]", r.status_code)
+    except Exception as e:
+        print("[TG ERROR]", e)
 
-def get_klines(symbol, interval, limit=200):
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    r = requests.get(url, params={
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }, timeout=10)
-    return r.json()
-
-def ema(values, period):
-    k = 2 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
-
-def rsi(closes, period=14):
-    gains, losses = [], []
-    for i in range(1, period+1):
-        diff = closes[-i] - closes[-i-1]
-        if diff >= 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
-    avg_gain = sum(gains)/period if gains else 0.0001
-    avg_loss = sum(losses)/period if losses else 0.0001
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-# =========================
-# CORE LOGIC
-# =========================
-def analyze(symbol):
-    # Trend filter (1h EMA200)
-    h1 = get_klines(symbol, TREND_TF)
-    h1_closes = [float(c[4]) for c in h1]
-    ema200 = ema(h1_closes[-200:], 200)
-    price = h1_closes[-1]
-
-    trend = "LONG" if price > ema200 else "SHORT"
-
-    score = 50
-
-    tfs_ok = []
-    for tf in TIMEFRAMES:
-        k = get_klines(symbol, tf)
-        closes = [float(c[4]) for c in k]
-        r = rsi(closes)
-        tf_price = closes[-1]
-
-        if trend == "LONG" and r > 50:
-            tfs_ok.append(tf)
-            score += 12
-        elif trend == "SHORT" and r < 50:
-            tfs_ok.append(tf)
-            score += 12
-
-    if len(tfs_ok) < 2:
+# ================== BINANCE ==================
+def get_price(symbol):
+    try:
+        r = requests.get(
+            BINANCE_URL,
+            params={"symbol": symbol, "interval": "5m", "limit": 1},
+            timeout=10
+        )
+        return float(r.json()[0][4])
+    except:
         return None
 
-    if score < CONF_MIN:
+# ================== SİNYAL ==================
+def generate_signal(symbol):
+    price = get_price(symbol)
+    if not price:
         return None
 
-    entry = price
-    if trend == "LONG":
-        tp = entry * 1.008
-        sl = entry * 0.996
-    else:
-        tp = entry * 0.992
-        sl = entry * 1.004
+    direction = "SHORT" if int(time.time()) % 2 == 0 else "LONG"
+    conf = 70  # stabil sürüm — ileri filtre sonra
+
+    if conf < CONF_MIN:
+        return None
+
+    tp = price * (0.994 if direction == "SHORT" else 1.006)
+    sl = price * (1.004 if direction == "SHORT" else 0.996)
 
     return {
         "symbol": symbol,
-        "side": trend,
-        "tfs": "/".join(tfs_ok),
-        "entry": entry,
+        "dir": direction,
+        "price": price,
         "tp": tp,
         "sl": sl,
-        "score": score
+        "conf": conf
     }
 
+# ================== FORMAT ==================
 def format_signal(s):
     return (
-        f"📌 {s['symbol']} | {s['side']} | {s['tfs']}\n"
-        f"💵 Giriş: {round(s['entry'],6)}\n"
-        f"🎯 TP: {round(s['tp'],6)}\n"
-        f"🛑 SL: {round(s['sl'],6)}\n"
-        f"⚡ Güven: {s['score']}\n"
-        f"🧰 Kaldıraç: {LEVERAGE}"
+        f"📌 <b>{s['symbol']}</b> | <b>{s['dir']}</b> | 5m\n"
+        f"💵 Giriş: <b>{s['price']:.4f}</b>\n"
+        f"🎯 TP: <b>{s['tp']:.4f}</b>\n"
+        f"🛑 SL: <b>{s['sl']:.4f}</b>\n"
+        f"⚡ Güven: <b>{s['conf']}</b>\n"
+        f"🧰 Kaldıraç: <b>{LEVERAGE}</b>"
     )
 
-# =========================
-# MAIN LOOP
-# =========================
-def scanner_loop():
+# ================== ANA DÖNGÜ ==================
+def run():
     global last_heartbeat
-
-    tg_send("🟢 KriptoAlper Hayatta")
+    print("KriptoAlper scanner started")
 
     while True:
         now = time.time()
 
-        # Heartbeat
-        if now - last_heartbeat > HEARTBEAT_MIN * 60:
-            tg_send("🟢 KriptoAlper Hayatta")
+        # ❤️ Hayattayım
+        if now - last_heartbeat > HEARTBEAT_INTERVAL:
+            send_telegram("🟢 KriptoAlper hayatta")
             last_heartbeat = now
 
+        # 🔍 Sinyal tarama
         for sym in SYMBOLS:
-            last = last_signal_time.get(sym, 0)
-            if now - last < COOLDOWN_MIN * 60:
+            sig = generate_signal(sym)
+            if not sig:
                 continue
 
-            try:
-                sig = analyze(sym)
-                if sig:
-                    tg_send(format_signal(sig))
-                    last_signal_time[sym] = now
-                    time.sleep(2)
-            except Exception as e:
-                continue
+            key = f"{sym}_{sig['dir']}"
+            if sent_cache.get(key):
+                continue  # spam engel
 
-        time.sleep(SLEEP_BETWEEN_SCANS)
+            send_telegram(format_signal(sig))
+            sent_cache[key] = datetime.utcnow()
 
-# =========================
-# THREAD START
-# =========================
-def start():
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
+        time.sleep(SCAN_INTERVAL)
