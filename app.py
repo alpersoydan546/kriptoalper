@@ -1,5 +1,7 @@
 from flask import Flask
-from scanner import start_scanner
+import threading
+import time
+import scanner
 
 app = Flask(__name__)
 
@@ -7,7 +9,11 @@ app = Flask(__name__)
 def home():
     return "ok"
 
-start_scanner()
+def start_scanner():
+    time.sleep(3)  # gunicorn tam kalksın
+    scanner.run()
 
 if __name__ == "__main__":
+    t = threading.Thread(target=start_scanner, daemon=True)
+    t.start()
     app.run(host="0.0.0.0", port=10000)
