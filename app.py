@@ -1,17 +1,13 @@
 from flask import Flask
-import threading
-import time
+from scanner import start_scanner
 
 app = Flask(__name__)
-
-def start_scanner():
-    import scanner
-    scanner.main_loop()
-
-# Scanner thread
-t = threading.Thread(target=start_scanner, daemon=True)
-t.start()
 
 @app.route("/")
 def home():
     return "ok"
+
+start_scanner()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
