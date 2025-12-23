@@ -3,27 +3,14 @@ import time
 import requests
 from datetime import datetime
 
-# ================== ENV ==================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID"))
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
-
-# ================== AYARLAR ==================
-SCAN_INTERVAL = 300          # 5 dk
-HEARTBEAT_INTERVAL = 1800    # 30 dk
+HEARTBEAT_MIN = 30  # 30 dakikada bir hayattayım
 CONF_MIN = 70
-LEVERAGE = "7x"
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
-    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT"
-]
+LAST_HEARTBEAT = 0
 
-sent_cache = {}
-last_heartbeat = 0
-
-# ================== TELEGRAM ==================
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] Telegram ENV yok")
@@ -32,86 +19,68 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
+        "text": msg
     }
+
     try:
         r = requests.post(url, data=payload, timeout=10)
-        print("[TG]", r.status_code)
+        print("[TG]", r.status_code, r.text)
     except Exception as e:
         print("[TG ERROR]", e)
 
-# ================== BINANCE ==================
-def get_price(symbol):
-    try:
-        r = requests.get(
-            BINANCE_URL,
-            params={"symbol": symbol, "interval": "5m", "limit": 1},
-            timeout=10
-        )
-        return float(r.json()[0][4])
-    except:
-        return None
+def heartbeat():
+    global LAST_HEARTBEAT
+    now = time.time()
+    if now - LAST_HEARTBEAT >= HEARTBEAT_MIN * 60:
+        send_telegram("🟢 KriptoAlper Hayatta")
+        LAST_HEARTBEAT = now
 
-# ================== SİNYAL ==================
-def generate_signal(symbol):
-    price = get_price(symbol)
-    if not price:
-        return None
-
-    direction = "SHORT" if int(time.time()) % 2 == 0 else "LONG"
-    conf = 70  # stabil sürüm — ileri filtre sonra
-
-    if conf < CONF_MIN:
-        return None
-
-    tp = price * (0.994 if direction == "SHORT" else 1.006)
-    sl = price * (1.004 if direction == "SHORT" else 0.996)
-
-    return {
-        "symbol": symbol,
-        "dir": direction,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "conf": conf
+def fake_signal_generator():
+    """
+    Şimdilik test sinyali.
+    Gerçek scanner logic buraya gelecek.
+    """
+    signal = {
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "tf": "5m/15m",
+        "entry": 87000,
+        "tp": 87600,
+        "sl": 86600,
+        "confidence": 74,
+        "lev": "7x"
     }
 
-# ================== FORMAT ==================
-def format_signal(s):
-    return (
-        f"📌 <b>{s['symbol']}</b> | <b>{s['dir']}</b> | 5m\n"
-        f"💵 Giriş: <b>{s['price']:.4f}</b>\n"
-        f"🎯 TP: <b>{s['tp']:.4f}</b>\n"
-        f"🛑 SL: <b>{s['sl']:.4f}</b>\n"
-        f"⚡ Güven: <b>{s['conf']}</b>\n"
-        f"🧰 Kaldıraç: <b>{LEVERAGE}</b>"
+    if signal["confidence"] < CONF_MIN:
+        return
+
+    msg = (
+        f"📌 {signal['symbol']} | {signal['side']} | {signal['tf']}\n"
+        f"💵 Giriş: {signal['entry']}\n"
+        f"🎯 TP: {signal['tp']}\n"
+        f"🛑 SL: {signal['sl']}\n"
+        f"⚡ Güven: {signal['confidence']}\n"
+        f"🧰 Kaldıraç: {signal['lev']}"
     )
 
-# ================== ANA DÖNGÜ ==================
-def run():
-    global last_heartbeat
-    print("KriptoAlper scanner started")
+    send_telegram(msg)
+
+def main():
+    send_telegram("🚀 KriptoAlper scanner başladı")
+
+    last_signal_time = 0
 
     while True:
-        now = time.time()
+        try:
+            heartbeat()
 
-        # ❤️ Hayattayım
-        if now - last_heartbeat > HEARTBEAT_INTERVAL:
-            send_telegram("🟢 KriptoAlper hayatta")
-            last_heartbeat = now
+            # 10 dakikada bir test sinyali
+            if time.time() - last_signal_time > 600:
+                fake_signal_generator()
+                last_signal_time = time.time()
 
-        # 🔍 Sinyal tarama
-        for sym in SYMBOLS:
-            sig = generate_signal(sym)
-            if not sig:
-                continue
+            time.sleep(5)
 
-            key = f"{sym}_{sig['dir']}"
-            if sent_cache.get(key):
-                continue  # spam engel
-
-            send_telegram(format_signal(sig))
-            sent_cache[key] = datetime.utcnow()
-
-        time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            send_telegram(f"❌ Scanner hata: {e}")
+            time.sleep(10)
