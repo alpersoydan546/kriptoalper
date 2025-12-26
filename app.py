@@ -1,3 +1,4 @@
+import os
 from flask import Flask
 import threading
 import scanner
@@ -8,10 +9,12 @@ app = Flask(__name__)
 def health():
     return "ok"
 
-def run_scanner():
-    pass  # scanner zaten import ile çalışıyor
+def start_scanner():
+    scanner.run_scanner()
 
-threading.Thread(target=run_scanner, daemon=True).start()
+# Scanner sadece 1 kez başlasın
+threading.Thread(target=start_scanner, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
