@@ -1,14 +1,16 @@
 from flask import Flask
 import threading
+from scanner import scanner_loop
 
 app = Flask(__name__)
 
 @app.route("/")
-def health():
+def home():
     return "ok"
 
 def start_scanner():
-    import scanner
-    scanner.run_scanner()
+    t = threading.Thread(target=scanner_loop)
+    t.daemon = True
+    t.start()
 
-threading.Thread(target=start_scanner, daemon=True).start()
+start_scanner()
