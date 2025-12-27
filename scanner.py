@@ -1,38 +1,27 @@
 import time
-import os
 import requests
-import hashlib
-from datetime import datetime, timedelta
-from collections import defaultdict
+import os
+from datetime import datetime
 import math
 
 BINANCE_URL = "https://fapi.binance.com"
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT"
-]
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+INTERVAL = "5m"
 
-MIN_CONFIDENCE = 75
-SCAN_INTERVAL = 60
-COOLDOWN_MINUTES = 45
-MAX_DIRECTION_PER_15M = 2
+last_signal_time = {}
+last_heartbeat = 0
 
-last_sent = {}
-direction_counter = defaultdict(list)
-last_heartbeat = datetime.utcnow()
+def send_tg(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TG_CHAT, "text": text})
-
-def get_klines(symbol, interval="5m", limit=100):
-    r = requests.get(f"{BINANCE_URL}/klines", params={
-        "symbol": symbol, "interval": interval, "limit": limit
-    }, timeout=10)
-    return r.json()
+def get_klines(symbol, limit=210):
+    url = f"{BINANCE_URL}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
+    return requests.get(url, params=params, timeout=10).json()
 
 def ema(values, period):
     k = 2 / (period + 1)
@@ -41,111 +30,84 @@ def ema(values, period):
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
 
-def rsi(closes, period=14):
+def rsi(values, period=14):
     gains, losses = [], []
     for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i-1]
+        diff = values[i] - values[i - 1]
         gains.append(max(diff, 0))
         losses.append(abs(min(diff, 0)))
-    if sum(losses) == 0:
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
         return 100
-    rs = (sum(gains)/period) / (sum(losses)/period)
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def atr(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, period + 1):
-        tr = max(
-            highs[-i] - lows[-i],
-            abs(highs[-i] - closes[-i-1]),
-            abs(lows[-i] - closes[-i-1])
-        )
-        trs.append(tr)
-    return sum(trs) / period
+def calculate_confidence(rsi_val, trend_ok, ema_cross):
+    score = 50
+    if trend_ok:
+        score += 15
+    if ema_cross:
+        score += 15
+    if 45 < rsi_val < 65:
+        score += 10
+    return min(score, 90)
 
-def confidence_score(trend, rsi_val, atr_ratio, btc_penalty):
-    score = 0
-    score += 25 if trend else 0
-    score += 20 if rsi_val < 30 or rsi_val > 70 else 10
-    score += 20 if atr_ratio > 0.003 else 10
-    score -= btc_penalty
-    return score
-
-def can_send(symbol, direction):
-    now = datetime.utcnow()
-
-    if symbol in last_sent:
-        if now - last_sent[symbol] < timedelta(minutes=COOLDOWN_MINUTES):
-            return False
-
-    direction_counter[direction] = [
-        t for t in direction_counter[direction]
-        if now - t < timedelta(minutes=15)
-    ]
-
-    if len(direction_counter[direction]) >= MAX_DIRECTION_PER_15M:
-        return False
-
-    direction_counter[direction].append(now)
-    return True
-
-def scan():
+def scanner_loop():
     global last_heartbeat
 
-    # HEARTBEAT
-    if datetime.utcnow() - last_heartbeat > timedelta(minutes=30):
-        send_telegram("🟢 KriptoAlper Hayatta")
-        last_heartbeat = datetime.utcnow()
+    send_tg("🟢 KriptoAlper başlatıldı")
 
-    btc_klines = get_klines("BTCUSDT")
-    btc_closes = [float(k[4]) for k in btc_klines]
-    btc_trend = btc_closes[-1] > ema(btc_closes[-50:], 50)
+    while True:
+        now = time.time()
 
-    for symbol in SYMBOLS:
-        klines = get_klines(symbol)
-        closes = [float(k[4]) for k in klines]
-        highs = [float(k[2]) for k in klines]
-        lows  = [float(k[3]) for k in klines]
+        if now - last_heartbeat > 1800:
+            send_tg("🟢 KriptoAlper Hayatta")
+            last_heartbeat = now
 
-        price = closes[-1]
-        ema50 = ema(closes[-50:], 50)
-        ema200 = ema(closes[-200:], 200)
-        trend = price > ema50 > ema200 or price < ema50 < ema200
+        for symbol in SYMBOLS:
+            try:
+                klines = get_klines(symbol)
+                closes = [float(k[4]) for k in klines]
 
-        direction = "LONG" if price > ema50 else "SHORT"
-        rsi_val = rsi(closes)
-        atr_val = atr(highs, lows, closes)
-        atr_ratio = atr_val / price
+                ema200 = ema(closes[-200:], 200)
+                ema12_prev = ema(closes[-26:-14], 12)
+                ema26_prev = ema(closes[-26:-14], 26)
+                ema12_now = ema(closes[-14:], 12)
+                ema26_now = ema(closes[-14:], 26)
 
-        btc_penalty = 15 if direction == ("LONG" if btc_trend else "SHORT") else 0
+                price = closes[-1]
+                rsi_val = rsi(closes[-15:])
 
-        confidence = confidence_score(trend, rsi_val, atr_ratio, btc_penalty)
+                trend_ok = price > ema200
+                ema_cross = ema12_prev < ema26_prev and ema12_now > ema26_now
 
-        if confidence < MIN_CONFIDENCE:
-            continue
+                confidence = calculate_confidence(rsi_val, trend_ok, ema_cross)
 
-        if not can_send(symbol, direction):
-            continue
+                if confidence < 65:
+                    continue
 
-        tp = price + atr_val * (1 if direction == "LONG" else -1.2)
-        sl = price - atr_val * (0.8 if direction == "LONG" else -0.8)
+                last_time = last_signal_time.get(symbol, 0)
+                if time.time() - last_time < 3600:
+                    continue
 
-        msg = (
-            f"📌 {symbol} | {direction} | 5m/15m\n"
-            f"💵 Giriş: {price:.4f}\n"
-            f"🎯 TP: {tp:.4f}\n"
-            f"🛑 SL: {sl:.4f}\n"
-            f"⚡ Güven: {confidence}\n"
-            f"🧰 Kaldıraç: 7x"
-        )
+                direction = "LONG" if trend_ok else "SHORT"
+                tp = round(price * 1.007, 2)
+                sl = round(price * 0.993, 2)
 
-        send_telegram(msg)
-        last_sent[symbol] = datetime.utcnow()
+                msg = (
+                    f"📌 {symbol} | {direction} | 5m\n"
+                    f"💰 Giriş: {round(price,2)}\n"
+                    f"🎯 TP: {tp}\n"
+                    f"🛑 SL: {sl}\n"
+                    f"⚡ Güven: {confidence}\n"
+                    f"📊 Kaldıraç: 5x"
+                )
 
-while True:
-    try:
-        scan()
-        time.sleep(SCAN_INTERVAL)
-    except Exception as e:
-        print("SCAN ERROR:", e)
-        time.sleep(10)
+                send_tg(msg)
+                last_signal_time[symbol] = time.time()
+
+            except Exception as e:
+                print("HATA:", e)
+
+        time.sleep(60)
