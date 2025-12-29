@@ -1,27 +1,49 @@
 import time
-import requests
-import os
-from datetime import datetime
 import math
+import requests
+import threading
+from datetime import datetime, timedelta
 
-BINANCE_URL = "https://fapi.binance.com"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ================= CONFIG =================
+BINANCE_FUTURES = "https://fapi.binance.com"
+SYMBOLS = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","AVAXUSDT",
+    "LINKUSDT","INJUSDT","OPUSDT","ARBUSDT","SEIUSDT",
+    "XRPUSDT","ADAUSDT"
+]
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-INTERVAL = "5m"
+CONF_MIN = 75
+COOLDOWN_MIN = 90
+SCAN_INTERVAL = 60
+HEARTBEAT_MIN = 30
 
-last_signal_time = {}
+TG_TOKEN = None
+TG_CHAT = None
+
+# ============== STATE =====================
+last_signal = {}
+open_trades = []
 last_heartbeat = 0
 
-def send_tg(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+# ============== HELPERS ===================
+def tg_send(msg):
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": TG_CHAT,
+        "text": msg,
+        "parse_mode": "HTML"
+    }, timeout=10)
 
-def get_klines(symbol, limit=210):
-    url = f"{BINANCE_URL}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
-    return requests.get(url, params=params, timeout=10).json()
+def klines(symbol, interval, limit=100):
+    url = f"{BINANCE_FUTURES}/fapi/v1/klines"
+    r = requests.get(url, params={
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }, timeout=10)
+    return r.json()
 
 def ema(values, period):
     k = 2 / (period + 1)
@@ -32,82 +54,109 @@ def ema(values, period):
 
 def rsi(values, period=14):
     gains, losses = [], []
-    for i in range(1, period + 1):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    for i in range(1, len(values)):
+        diff = values[i] - values[i-1]
+        gains.append(max(diff,0))
+        losses.append(abs(min(diff,0)))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_confidence(rsi_val, trend_ok, ema_cross):
-    score = 50
-    if trend_ok:
-        score += 15
-    if ema_cross:
-        score += 15
-    if 45 < rsi_val < 65:
-        score += 10
-    return min(score, 90)
+# ============== CORE ======================
+def analyze(symbol):
+    try:
+        c5 = klines(symbol,"5m",100)
+        c15 = klines(symbol,"15m",100)
+        c1h = klines(symbol,"1h",100)
 
-def scanner_loop():
+        closes5 = [float(x[4]) for x in c5]
+        closes15 = [float(x[4]) for x in c15]
+        closes1h = [float(x[4]) for x in c1h]
+
+        ema5 = ema(closes5[-30:],21)
+        ema15 = ema(closes15[-30:],21)
+        ema1h = ema(closes1h[-30:],50)
+
+        rsi5 = rsi(closes5)
+        rsi15 = rsi(closes15)
+
+        price = closes5[-1]
+
+        trend_up = price > ema1h
+        trend_down = price < ema1h
+
+        score = 0
+        score += 20 if trend_up or trend_down else 0
+        score += 20 if ema5 > ema15 or ema5 < ema15 else 0
+        score += 20 if 45 < rsi5 < 65 else 0
+        score += 15 if 45 < rsi15 < 65 else 0
+        score += 20 if abs(price-ema5)/price < 0.003 else 0
+
+        if score < CONF_MIN:
+            return None
+
+        side = "LONG" if trend_up else "SHORT"
+        entry = price
+        tp = entry * (1.004 if side=="LONG" else 0.996)
+        sl = entry * (0.998 if side=="LONG" else 1.002)
+
+        return {
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "score": score
+        }
+
+    except Exception:
+        return None
+
+# ============== LOOP ======================
+def main_loop():
     global last_heartbeat
-
-    send_tg("🟢 KriptoAlper başlatıldı")
 
     while True:
         now = time.time()
 
-        if now - last_heartbeat > 1800:
-            send_tg("🟢 KriptoAlper Hayatta")
+        # HEARTBEAT
+        if now - last_heartbeat > HEARTBEAT_MIN*60:
+            tg_send("🟢 <b>KriptoAlper Hayatta</b>")
             last_heartbeat = now
 
-        for symbol in SYMBOLS:
-            try:
-                klines = get_klines(symbol)
-                closes = [float(k[4]) for k in klines]
-
-                ema200 = ema(closes[-200:], 200)
-                ema12_prev = ema(closes[-26:-14], 12)
-                ema26_prev = ema(closes[-26:-14], 26)
-                ema12_now = ema(closes[-14:], 12)
-                ema26_now = ema(closes[-14:], 26)
-
-                price = closes[-1]
-                rsi_val = rsi(closes[-15:])
-
-                trend_ok = price > ema200
-                ema_cross = ema12_prev < ema26_prev and ema12_now > ema26_now
-
-                confidence = calculate_confidence(rsi_val, trend_ok, ema_cross)
-
-                if confidence < 65:
+        for sym in SYMBOLS:
+            if sym in last_signal:
+                if now - last_signal[sym] < COOLDOWN_MIN*60:
                     continue
 
-                last_time = last_signal_time.get(symbol, 0)
-                if time.time() - last_time < 3600:
-                    continue
+            sig = analyze(sym)
+            if not sig:
+                continue
 
-                direction = "LONG" if trend_ok else "SHORT"
-                tp = round(price * 1.007, 2)
-                sl = round(price * 0.993, 2)
+            last_signal[sym] = now
+            open_trades.append({
+                **sig,
+                "time": datetime.now()
+            })
 
-                msg = (
-                    f"📌 {symbol} | {direction} | 5m\n"
-                    f"💰 Giriş: {round(price,2)}\n"
-                    f"🎯 TP: {tp}\n"
-                    f"🛑 SL: {sl}\n"
-                    f"⚡ Güven: {confidence}\n"
-                    f"📊 Kaldıraç: 5x"
-                )
+            msg = (
+                f"📌 <b>{sig['symbol']}</b> | <b>{sig['side']}</b> | 5m/15m\n"
+                f"💵 Giriş: {sig['entry']:.6f}\n"
+                f"🎯 TP: {sig['tp']:.6f}\n"
+                f"🛑 SL: {sig['sl']:.6f}\n"
+                f"⚡ Güven: {sig['score']}\n"
+                f"🧰 Kaldıraç: 7x"
+            )
+            tg_send(msg)
 
-                send_tg(msg)
-                last_signal_time[symbol] = time.time()
+        time.sleep(SCAN_INTERVAL)
 
-            except Exception as e:
-                print("HATA:", e)
-
-        time.sleep(60)
+# ============== START =====================
+def start(token, chat):
+    global TG_TOKEN, TG_CHAT
+    TG_TOKEN = token
+    TG_CHAT = chat
+    threading.Thread(target=main_loop, daemon=True).start()
