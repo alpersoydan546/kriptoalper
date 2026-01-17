@@ -1,56 +1,46 @@
-import os
 import time
 import requests
-from datetime import datetime, timedelta
-from threading import Thread, Lock
 import math
+from datetime import datetime, timedelta
 
-# ================== AYARLAR ==================
-BINANCE = "https://fapi.binance.com"
-TF_FAST = "5m"
-TF_TREND = "15m"
+# =====================
+# CONFIG
+# =====================
+BINANCE_FUTURES = "https://fapi.binance.com"
+SYMBOLS = ["BTCUSDT","ETHUSDT","DOGEUSDT","LINKUSDT","DOTUSDT","OPUSDT"]
+LEVERAGE = 7
+SCAN_INTERVAL = 30  # saniye
+COOLDOWN_MINUTES = 30
+MAX_SAME_DIRECTION = 2
 
-SCAN_SLEEP = 60
-HEARTBEAT_MIN = 30
-COOLDOWN_MIN = 45
+MIN_RR = 1.5
+MIN_TP_PERCENT = 0.25
 
-MIN_CONF = 75
+telegram_token = None
+telegram_chat = None
 
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "ADAUSDT","LINKUSDT","AVAXUSDT","DOGEUSDT","DOTUSDT",
-    "INJUSDT","OPUSDT","ARBUSDT","SEIUSDT"
-]
-# ============================================
+last_signal_time = {}
+active_directions = {"LONG": 0, "SHORT": 0}
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# =====================
+# ENV
+# =====================
+def set_env(token, chat):
+    global telegram_token, telegram_chat
+    telegram_token = token
+    telegram_chat = chat
 
-lock = Lock()
-cooldowns = {}
-last_heartbeat = datetime.utcnow()
+# =====================
+# HELPERS
+# =====================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+    requests.post(url, json={"chat_id": telegram_chat, "text": msg})
 
-# ---------------- TELEGRAM ----------------
-def tg_send(text):
-    if not TOKEN or not CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text},
-            timeout=10
-        )
-    except:
-        pass
-
-# ---------------- BINANCE ----------------
-def get_klines(symbol, tf, limit=100):
-    r = requests.get(
-        f"{BINANCE}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": tf, "limit": limit},
-        timeout=10
-    )
-    return r.json()
+def get_klines(symbol, interval, limit=100):
+    url = f"{BINANCE_FUTURES}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    return requests.get(url, params=params, timeout=10).json()
 
 def ema(values, period):
     k = 2 / (period + 1)
@@ -59,131 +49,82 @@ def ema(values, period):
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
 
-def rsi(values, period=14):
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        delta = values[-i] - values[-i - 1]
-        if delta >= 0:
-            gains.append(delta)
-        else:
-            losses.append(abs(delta))
-    if not losses:
-        return 100
-    rs = (sum(gains) / period) / (sum(losses) / period)
-    return 100 - (100 / (1 + rs))
-
-def atr(klines, period=14):
-    trs = []
-    for i in range(1, period + 1):
-        high = float(klines[-i][2])
-        low = float(klines[-i][3])
-        prev_close = float(klines[-i - 1][4])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return sum(trs) / period
-
-# ---------------- STRATEJİ ----------------
-def analyze(symbol):
-    k5 = get_klines(symbol, TF_FAST, 120)
-    k15 = get_klines(symbol, TF_TREND, 120)
-
-    closes5 = [float(k[4]) for k in k5]
-    closes15 = [float(k[4]) for k in k15]
-
-    ema200_15 = ema(closes15[-200:], 200)
-    ema50_15 = ema(closes15[-50:], 50)
-
-    trend = "LONG" if ema50_15 > ema200_15 else "SHORT"
-
-    last = closes5[-1]
-    prev = closes5[-2]
-
-    if last > prev and trend == "LONG":
-        direction = "LONG"
-    elif last < prev and trend == "SHORT":
-        direction = "SHORT"
+def rr_ratio(entry, tp, sl, direction):
+    if direction == "LONG":
+        return abs(tp - entry) / abs(entry - sl)
     else:
-        return None
+        return abs(entry - tp) / abs(sl - entry)
 
-    r = rsi(closes5)
-    if direction == "LONG" and r > 70:
-        return None
-    if direction == "SHORT" and r < 30:
-        return None
+# =====================
+# STRATEGY
+# =====================
+def analyze(symbol):
+    global active_directions
 
-    a = atr(k5)
-    entry = last
+    # Cooldown
+    if symbol in last_signal_time:
+        if datetime.utcnow() - last_signal_time[symbol] < timedelta(minutes=COOLDOWN_MINUTES):
+            return
 
-    tp = entry + (a * 1.5 if direction == "LONG" else -a * 1.5)
-    sl = entry - (a if direction == "LONG" else -a)
+    kl5 = get_klines(symbol, "5m")
+    kl15 = get_klines(symbol, "15m")
 
-    confidence = 60
-    confidence += 10 if abs(last - prev) / entry > 0.001 else 0
-    confidence += 10 if abs(ema50_15 - ema200_15) / ema200_15 > 0.002 else 0
-    confidence += 10 if 40 < r < 60 else 0
+    closes5 = [float(k[4]) for k in kl5]
+    closes15 = [float(k[4]) for k in kl15]
 
-    if confidence < MIN_CONF:
-        return None
+    price = closes5[-1]
 
-    return {
-        "symbol": symbol,
-        "dir": direction,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "conf": confidence,
-        "lev": 7
-    }
+    ema200_5 = ema(closes5[-200:], 200)
+    ema200_15 = ema(closes15[-200:], 200)
 
-# ---------------- COOLDOWN ----------------
-def can_send(symbol, direction):
-    key = f"{symbol}_{direction}_{TF_FAST}"
-    now = datetime.utcnow()
-    with lock:
-        if key in cooldowns and now < cooldowns[key]:
-            return False
-        cooldowns[key] = now + timedelta(minutes=COOLDOWN_MIN)
-        return True
+    # Trend
+    if price < ema200_5 and price < ema200_15:
+        direction = "SHORT"
+    elif price > ema200_5 and price > ema200_15:
+        direction = "LONG"
+    else:
+        return
 
-# ---------------- HEARTBEAT ----------------
-def heartbeat_loop():
-    global last_heartbeat
-    while True:
-        if datetime.utcnow() - last_heartbeat >= timedelta(minutes=HEARTBEAT_MIN):
-            tg_send("🟢 KriptoAlper Hayatta")
-            last_heartbeat = datetime.utcnow()
-        time.sleep(10)
+    if active_directions[direction] >= MAX_SAME_DIRECTION:
+        return
 
-# ---------------- SCANNER ----------------
+    # TP / SL (ATR benzeri basit oran)
+    tp = price * (1 - 0.003) if direction == "SHORT" else price * (1 + 0.003)
+    sl = price * (1 + 0.0018) if direction == "SHORT" else price * (1 - 0.0018)
+
+    tp_percent = abs(tp - price) / price * 100
+    rr = rr_ratio(price, tp, sl, direction)
+
+    if tp_percent < MIN_TP_PERCENT:
+        return
+    if rr < MIN_RR:
+        return
+
+    # PASS ALL FILTERS ✅
+    last_signal_time[symbol] = datetime.utcnow()
+    active_directions[direction] += 1
+
+    msg = f"""📌 {symbol} | {direction} | 5m/15m
+💵 Giriş: {price:.6f}
+🎯 TP: {tp:.6f}
+🛑 SL: {sl:.6f}
+⚡ Güven: 85
+🧰 Kaldıraç: {LEVERAGE}x"""
+
+    send_telegram(msg)
+
+# =====================
+# LOOP
+# =====================
 def scanner_loop():
-    tg_send("🚀 KriptoAlper scanner başlatıldı")
+    send_telegram("🚀 KriptoAlper scanner başlatıldı")
     while True:
-        for sym in SYMBOLS:
-            try:
-                sig = analyze(sym)
-                if not sig:
-                    continue
-
-                if not can_send(sig["symbol"], sig["dir"]):
-                    continue
-
-                msg = (
-                    f"📌 {sig['symbol']} | {sig['dir']} | 5m/15m\n"
-                    f"💵 Giriş: {sig['entry']:.6f}\n"
-                    f"🎯 TP: {sig['tp']:.6f}\n"
-                    f"🛑 SL: {sig['sl']:.6f}\n"
-                    f"⚡ Güven: {sig['conf']}\n"
-                    f"🧰 Kaldıraç: {sig['lev']}x"
-                )
-
-                tg_send(msg)
-
-            except Exception:
-                pass
-
-        time.sleep(SCAN_SLEEP)
-
-# ---------------- START ----------------
-def start():
-    Thread(target=heartbeat_loop, daemon=True).start()
-    scanner_loop()
+        try:
+            active_directions["LONG"] = 0
+            active_directions["SHORT"] = 0
+            for sym in SYMBOLS:
+                analyze(sym)
+            time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            print("Scanner error:", e)
+            time.sleep(10)
