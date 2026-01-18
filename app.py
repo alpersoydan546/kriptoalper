@@ -1,5 +1,6 @@
-from flask import Flask
+import os
 import threading
+from flask import Flask
 import scanner
 
 app = Flask(__name__)
@@ -8,10 +9,9 @@ app = Flask(__name__)
 def health():
     return "ok", 200
 
-def start_bot():
-    print("[APP] Scanner starting...")
-    scanner.start()
+def start():
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    scanner.run(token, chat)
 
-# 🔥 GUNICORN SAFE
-threading.Thread(target=start_bot, daemon=True).start()
-
+threading.Thread(target=start, daemon=True).start()
