@@ -10,93 +10,93 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
-# AYARLAR (Render'dan gelir)
+# AYARLAR
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TF = os.getenv("TF", "15m") 
 SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","LINKUSDT","AVAXUSDT","DOTUSDT"]
 
-# HAFIZA SİSTEMİ
-last_sent_signals = {}  # { 'BTCUSDT_LONG': datetime }
-COOLDOWN_MINUTES = 180  # 3 saat boyunca aynı yönü tekrar atma
+# HAFIZA
+last_sent_signals = {}
+COOLDOWN_MINUTES = 180 
 
 def tg_send(msg):
     if not TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        logger.error(f"Telegram hatası: {e}")
+    except:
+        pass
 
-def fetch_data(symbol):
+def fetch_data(symbol, interval, limit=200):
     url = "https://fapi.binance.com/fapi/v1/klines"
     try:
-        params = {"symbol": symbol, "interval": TF, "limit": 100}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         df = pd.DataFrame(r.json(), columns=['t','o','h','l','c','v','ct','qv','nt','tbv','tqv','i'])
-        df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
+        df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
         return df
     except:
         return None
 
 def calc_signal(symbol):
-    df = fetch_data(symbol)
-    if df is None or len(df) < 30: return None
+    df = fetch_data(symbol, TF)
+    if df is None or len(df) < 100: return None
 
-    # RSI Hesapla
-    rsi = ta.rsi(df['close'], length=14).iloc[-1]
-    last_price = df['close'].iloc[-1]
+    # İNDİKATÖRLER
+    rsi = ta.rsi(df['c'], length=14).iloc[-1]
+    ema200 = ta.ema(df['c'], length=200).iloc[-1]
+    atr = ta.atr(df['h'], df['l'], df['c'], length=14).iloc[-1]
+    last_price = df['c'].iloc[-1]
     
     # Hacim Analizi
-    avg_vol = df['volume'].rolling(20).mean().iloc[-1]
-    curr_vol = df['volume'].iloc[-1]
-    vol_boost = curr_vol > (avg_vol * 1.3)
+    avg_vol = df['v'].rolling(20).mean().iloc[-1]
+    curr_vol = df['v'].iloc[-1]
+    vol_boost = curr_vol > (avg_vol * 1.5)
 
     direction = None
-    if rsi < 30:
+    # STRATEJİ: Fiyat EMA200 üzerindeyse sadece LONG, altındaysa sadece SHORT
+    if last_price > ema200 and rsi < 35:
         direction = "LONG"
         emoji = "🟢"
-        stop = round(last_price * 0.98, 4) # %2 Stop
-    elif rsi > 70:
+        stop = round(last_price - (atr * 2), 4) # Dinamik Stop
+        tp = round(last_price + (atr * 3), 4)   # Dinamik TP (Risk/Ödül 1.5)
+    elif last_price < ema200 and rsi > 65:
         direction = "SHORT"
         emoji = "🔴"
-        stop = round(last_price * 1.02, 4) # %2 Stop
+        stop = round(last_price + (atr * 2), 4)
+        tp = round(last_price - (atr * 3), 4)
 
     if direction:
-        # Cooldown Kontrolü (Coin + Yön bazlı)
         key = f"{symbol}_{direction}"
         now = datetime.now()
         if key in last_sent_signals:
             if now - last_sent_signals[key] < timedelta(minutes=COOLDOWN_MINUTES):
                 return None
         
-        # Güven Skoru
-        conf = 60
-        if rsi < 25 or rsi > 75: conf += 20
-        if vol_boost: conf += 20
+        # GÜVEN SKORU HESABI
+        conf = 70
+        if rsi < 25 or rsi > 75: conf += 10 # Aşırı alım/satım onayı
+        if vol_boost: conf += 20          # Hacim onayı
         conf = min(conf, 100)
 
-        # Sadece %75 ve üzeri güveni at (Orta seviye filtre)
-        if conf < 75: return None
+        if conf < 80: return None # Sadece yüksek kaliteli sinyaller
 
         last_sent_signals[key] = now
-        duration = "2-4 Saat" if TF == "15m" else "8-12 Saat"
-
+        
         return (
             f"🎯 <b>#{symbol} {direction}</b> {emoji}\n\n"
             f"💵 <b>Giriş:</b> {last_price}\n"
             f"🛑 <b>Stop:</b> {stop}\n"
+            f"💰 <b>Hedef (TP):</b> {tp}\n"
             f"⚡ <b>Güven:</b> %{conf}\n"
-            f"⏳ <b>Vade:</b> ~{duration}"
+            f"📈 <b>Trend:</b> {'Boğa (EMA200 Üstü)' if direction == 'LONG' else 'Ayı (EMA200 Altı)'}\n"
         )
     return None
 
 def run(token, chat):
     global TOKEN, CHAT_ID
     TOKEN, CHAT_ID = token, chat
-    
-    tg_send("🚀 <b>KriptoAlper Scanner Aktif!</b>\nStrateji: RSI + Volume Spike")
+    tg_send("🚀 <b>KriptoAlper PRO Scanner Aktif!</b>\nTrend: EMA200 | Stop: ATR Dinamik")
     last_hb = datetime.now()
 
     while True:
@@ -105,14 +105,13 @@ def run(token, chat):
                 msg = calc_signal(sym)
                 if msg:
                     tg_send(msg)
-                time.sleep(2) # Binance sınırlaması için
+                time.sleep(1)
 
-            # 30 dk Hayattayım
             if datetime.now() - last_hb > timedelta(minutes=30):
                 tg_send("🛠 <b>Sistem Aktif:</b> Tarama devam ediyor...")
                 last_hb = datetime.now()
 
-            time.sleep(120) # 2 dakikada bir tur dön
+            time.sleep(120)
         except Exception as e:
-            logger.error(f"Ana döngü hatası: {e}")
+            logger.error(e)
             time.sleep(60)
