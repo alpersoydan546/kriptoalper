@@ -1,6 +1,5 @@
-requests>=2.31
-pandas>=2.0
-numpy>=1.26
-python-dotenv>=1.0
-gunicorn>=21.0
-flask>=3.0
+flask
+requests
+pandas
+pandas_ta
+gunicorn
