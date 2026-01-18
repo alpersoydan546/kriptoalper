@@ -1,157 +1,118 @@
 import time
 import requests
-import hashlib
+import pandas as pd
+import pandas_ta as ta
+import os
+import logging
 from datetime import datetime, timedelta
-from threading import Lock
 
-BINANCE = "https://fapi.binance.com"
-INTERVAL = "5m"
+# LOGLAMA
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger()
 
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "ADAUSDT","DOGEUSDT","LINKUSDT","AVAXUSDT","DOTUSDT"
-]
+# AYARLAR (Render'dan gelir)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TF = os.getenv("TF", "15m") 
+SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","LINKUSDT","AVAXUSDT","DOTUSDT"]
 
-CONF_MIN = 80
-SCAN_SLEEP = 90          # 1.5 dk
-COOLDOWN_MIN = 45
-HEARTBEAT_MIN = 30
-
-TELEGRAM_TOKEN = None
-CHAT_ID = None
-
-last_sent = {}
-last_heartbeat = datetime.utcnow()
-lock = Lock()
-
-# ------------------ TELEGRAM ------------------
+# HAFIZA SİSTEMİ
+last_sent_signals = {}  # { 'BTCUSDT_LONG': datetime }
+COOLDOWN_MINUTES = 180  # 3 saat boyunca aynı yönü tekrar atma
 
 def tg_send(msg):
+    if not TOKEN or not CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": msg},
-            timeout=10
-        )
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        logger.error(f"Telegram hatası: {e}")
+
+def fetch_data(symbol):
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    try:
+        params = {"symbol": symbol, "interval": TF, "limit": 100}
+        r = requests.get(url, params=params, timeout=10)
+        df = pd.DataFrame(r.json(), columns=['t','o','h','l','c','v','ct','qv','nt','tbv','tqv','i'])
+        df['close'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        return df
     except:
-        pass
-
-# ------------------ DATA ------------------
-
-def fetch_klines(symbol, limit=30):
-    r = requests.get(
-        BINANCE + "/fapi/v1/klines",
-        params={"symbol": symbol, "interval": INTERVAL, "limit": limit},
-        timeout=10
-    )
-    return r.json()
-
-# ------------------ SIGNAL ------------------
+        return None
 
 def calc_signal(symbol):
-    kl = fetch_klines(symbol)
-    closes = [float(k[4]) for k in kl]
+    df = fetch_data(symbol)
+    if df is None or len(df) < 30: return None
 
-    if len(closes) < 20:
-        return None
+    # RSI Hesapla
+    rsi = ta.rsi(df['close'], length=14).iloc[-1]
+    last_price = df['close'].iloc[-1]
+    
+    # Hacim Analizi
+    avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+    curr_vol = df['volume'].iloc[-1]
+    vol_boost = curr_vol > (avg_vol * 1.3)
 
-    last = closes[-1]
-    prev = closes[-2]
-
-    if last > prev:
+    direction = None
+    if rsi < 30:
         direction = "LONG"
-    elif last < prev:
+        emoji = "🟢"
+        stop = round(last_price * 0.98, 4) # %2 Stop
+    elif rsi > 70:
         direction = "SHORT"
-    else:
-        return None
+        emoji = "🔴"
+        stop = round(last_price * 1.02, 4) # %2 Stop
 
-    move = abs(last - prev) / last * 100
-    confidence = int(70 + move * 400)
-    confidence = min(confidence, 85)
+    if direction:
+        # Cooldown Kontrolü (Coin + Yön bazlı)
+        key = f"{symbol}_{direction}"
+        now = datetime.now()
+        if key in last_sent_signals:
+            if now - last_sent_signals[key] < timedelta(minutes=COOLDOWN_MINUTES):
+                return None
+        
+        # Güven Skoru
+        conf = 60
+        if rsi < 25 or rsi > 75: conf += 20
+        if vol_boost: conf += 20
+        conf = min(conf, 100)
 
-    if confidence < CONF_MIN:
-        return None
+        # Sadece %75 ve üzeri güveni at (Orta seviye filtre)
+        if conf < 75: return None
 
-    tp = last * (1.004 if direction == "LONG" else 0.996)
-    sl = last * (0.997 if direction == "LONG" else 1.003)
+        last_sent_signals[key] = now
+        duration = "2-4 Saat" if TF == "15m" else "8-12 Saat"
 
-    return {
-        "symbol": symbol,
-        "dir": direction,
-        "entry": last,
-        "tp": tp,
-        "sl": sl,
-        "conf": confidence,
-        "lev": 7
-    }
-
-# ------------------ COOLDOWN ------------------
-
-def sig_hash(sig):
-    raw = f"{sig['symbol']}{sig['dir']}{round(sig['entry'],4)}"
-    return hashlib.md5(raw.encode()).hexdigest()
-
-def can_send(sig):
-    h = sig_hash(sig)
-    now = datetime.utcnow()
-
-    with lock:
-        if h in last_sent:
-            if now - last_sent[h] < timedelta(minutes=COOLDOWN_MIN):
-                return False
-        last_sent[h] = now
-        return True
-
-# ------------------ FORMAT ------------------
-
-def format_msg(sig):
-    return (
-        f"📌 {sig['symbol']} | {sig['dir']} | 5m/15m\n"
-        f"💵 Giriş: {sig['entry']:.6f}\n"
-        f"🎯 TP: {sig['tp']:.6f}\n"
-        f"🛑 SL: {sig['sl']:.6f}\n"
-        f"⚡ Güven: {sig['conf']}\n"
-        f"🧰 Kaldıraç: {sig['lev']}x"
-    )
-
-# ------------------ HEARTBEAT ------------------
-
-def heartbeat():
-    global last_heartbeat
-    now = datetime.utcnow()
-    if now - last_heartbeat >= timedelta(minutes=HEARTBEAT_MIN):
-        tg_send("🟢 KriptoAlper Hayatta")
-        last_heartbeat = now
-
-# ------------------ MAIN LOOP ------------------
+        return (
+            f"🎯 <b>#{symbol} {direction}</b> {emoji}\n\n"
+            f"💵 <b>Giriş:</b> {last_price}\n"
+            f"🛑 <b>Stop:</b> {stop}\n"
+            f"⚡ <b>Güven:</b> %{conf}\n"
+            f"⏳ <b>Vade:</b> ~{duration}"
+        )
+    return None
 
 def run(token, chat):
-    global TELEGRAM_TOKEN, CHAT_ID
-    TELEGRAM_TOKEN = token
-    CHAT_ID = chat
-
-    tg_send("🚀 KriptoAlper scanner başlatıldı")
+    global TOKEN, CHAT_ID
+    TOKEN, CHAT_ID = token, chat
+    
+    tg_send("🚀 <b>KriptoAlper Scanner Aktif!</b>\nStrateji: RSI + Volume Spike")
+    last_hb = datetime.now()
 
     while True:
         try:
-            heartbeat()
-            sent_count = 0
-
             for sym in SYMBOLS:
-                if sent_count >= 3:   # SPAM ENGELİ
-                    break
+                msg = calc_signal(sym)
+                if msg:
+                    tg_send(msg)
+                time.sleep(2) # Binance sınırlaması için
 
-                sig = calc_signal(sym)
-                if not sig:
-                    continue
+            # 30 dk Hayattayım
+            if datetime.now() - last_hb > timedelta(minutes=30):
+                tg_send("🛠 <b>Sistem Aktif:</b> Tarama devam ediyor...")
+                last_hb = datetime.now()
 
-                if can_send(sig):
-                    tg_send(format_msg(sig))
-                    sent_count += 1
-
-            time.sleep(SCAN_SLEEP)
-
+            time.sleep(120) # 2 dakikada bir tur dön
         except Exception as e:
-            tg_send(f"❌ Scanner hata: {e}")
+            logger.error(f"Ana döngü hatası: {e}")
             time.sleep(60)
