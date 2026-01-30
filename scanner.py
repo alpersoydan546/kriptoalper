@@ -148,7 +148,7 @@ def run(token, chat):
             
             # 4 Saatte bir yaşam belirtisi
             if datetime.now() - last_health_check > timedelta(hours=4):
-                tg_send("🟢 Elite Scanner Taramaya Devam Ediyor...")
+                tg_send("🟢 Sistem Çalışıyor...")
                 last_health_check = datetime.now()
 
             for sym in SYMBOLS:
@@ -159,3 +159,4 @@ def run(token, chat):
             time.sleep(60)
         except:
             time.sleep(60)
+
