@@ -6,7 +6,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-# LOG AYARLARI
+# LOG AYARLARI (Sadece Hatalar)
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
@@ -49,16 +49,18 @@ def check_results():
         if current_data is None: continue
         last_price = current_data['c'].iloc[-1]
         
+        # TP KONTROL
         if (sig['side'] == "LONG" and last_price >= sig['tp']) or \
            (sig['side'] == "SHORT" and last_price <= sig['tp']):
             daily_report['tp'] += 1
-            tg_send(f"✅ <b>TP ALINDI: #{sig['symbol']}</b> (+Kâr)")
+            tg_send(f"✅ <b>TP VURULDU: #{sig['symbol']}</b>\nKasa Büyüyor! 💵")
             active_signals.remove(sig)
             
+        # SL KONTROL
         elif (sig['side'] == "LONG" and last_price <= sig['sl']) or \
              (sig['side'] == "SHORT" and last_price >= sig['sl']):
             daily_report['sl'] += 1
-            tg_send(f"⚠️ <b>STOP: #{sig['symbol']}</b> (Risk Kapatıldı)")
+            tg_send(f"⚠️ <b>STOP: #{sig['symbol']}</b>\nCan Sağlığı, Devam. 🛡️")
             active_signals.remove(sig)
 
 def send_daily_summary():
@@ -66,7 +68,8 @@ def send_daily_summary():
     now = datetime.now()
     if now.date() > last_report_date:
         if daily_report['total'] > 0:
-            tg_send(f"📊 <b>GÜNLÜK:</b> {daily_report['tp']} TP | {daily_report['sl']} SL")
+            msg = f"📊 <b>GÜNLÜK SKOR:</b> {daily_report['tp']} Kazanç | {daily_report['sl']} Kayıp"
+            tg_send(msg)
         daily_report = {"tp": 0, "sl": 0, "total": 0}
         last_report_date = now.date()
 
@@ -76,59 +79,80 @@ def calc_signal(symbol):
         df = fetch_data(symbol, TF)
         if df is None or len(df) < 200: return None
 
+        # VERİLER
         rsi = ta.rsi(df['c'], length=14).iloc[-1]
-        ema200 = ta.ema(df['c'], length=200).iloc[-1]
+        prev_rsi = ta.rsi(df['c'], length=14).iloc[-2] # Önceki RSI (Yön tayini için)
+        
         atr = ta.atr(df['h'], df['l'], df['c'], length=14).iloc[-1]
+        
+        # Bollinger (20, 2)
+        bb = ta.bbands(df['c'], length=20, std=2.0)
+        lower_band = bb['BBL_20_2.0'].iloc[-1]
+        upper_band = bb['BBU_20_2.0'].iloc[-1]
+        
         last_price = df['c'].iloc[-1]
-        prev_price = df['c'].iloc[-2]
+        open_price = df['c'].iloc[-1] # Anlık mum açılışı değil, o anki fiyatla kıyas için open'ı alalım
+        real_open = df['o'].iloc[-1]
         
         avg_vol = df['v'].rolling(20).mean().iloc[-1]
         curr_vol = df['v'].iloc[-1]
 
         direction = None
-        reasons = [] # Puan hesabı için nedenler
+        score = 0
 
-        # --- GÜVEN PUANI ALGORİTMASI ---
-        # Taban Puan: 60
-        score = 60
+        # --- STRATEJİ: Bollinger Reversal + RSI Onayı + Mum Rengi ---
 
-        # 1. RSI ANALİZİ
-        if last_price > ema200 and rsi < 35: # LONG
-            if last_price > prev_price: # Dönüş Mumu Şart
+        # LONG KRİTERLERİ
+        # 1. Fiyat Alt Banda değmiş veya altında.
+        # 2. RSI < 40 (Ucuz).
+        # 3. RSI Yükseliyor (prev_rsi < rsi) -> DÖNÜŞ BAŞLADI DEMEK.
+        # 4. Mum Rengi YEŞİL (last_price > real_open).
+        if last_price <= lower_band * 1.003 and rsi < 40:
+            if rsi > prev_rsi and last_price > real_open:
                 direction = "LONG"
-                score += 15 # RSI 35 altı (+15)
-                if rsi < 30: score += 10 # RSI 30 altı (Ekstra +10) -> Toplam 25
+                # Puanlama
+                score = 75 # Taban puan
+                score += (40 - rsi) # RSI ne kadar düşükse o kadar puan
+                if curr_vol > avg_vol: score += 10 # Hacim bonusu
 
-        elif last_price < ema200 and rsi > 65: # SHORT
-            if last_price < prev_price:
+        # SHORT KRİTERLERİ
+        # 1. Fiyat Üst Banda değmiş.
+        # 2. RSI > 60.
+        # 3. RSI Düşüyor (prev_rsi > rsi).
+        # 4. Mum Rengi KIRMIZI.
+        elif last_price >= upper_band * 0.997 and rsi > 60:
+            if rsi < prev_rsi and last_price < real_open:
                 direction = "SHORT"
-                score += 15
-                if rsi > 70: score += 10
+                # Puanlama
+                score = 75
+                score += (rsi - 60)
+                if curr_vol > avg_vol: score += 10
 
         if direction:
-            # 2. HACİM ANALİZİ
-            if curr_vol > avg_vol * 1.3: 
-                score += 10 # %30 Hacim artışı
-            if curr_vol > avg_vol * 2.0:
-                score += 10 # 2 Kat hacim (Ekstra +10)
+            # FİLTRE: Puan 80 altıysa riskli, atma.
+            if score < 80: return None
+            
+            # Puan Sınırı
+            score = min(int(score), 100)
 
-            # --- EŞİK KONTROLÜ ---
-            if score < 85: return None # 85 Altını Çöpe At
-
+            # Çifte Sinyal Önleme
             if any(s['symbol'] == symbol for s in active_signals): return None
 
+            # STOP/TP (Bollinger Scalping için Optimize)
             stop = round(last_price - (atr * 2.0), 4) if direction == "LONG" else round(last_price + (atr * 2.0), 4)
             tp = round(last_price + (atr * 3.0), 4) if direction == "LONG" else round(last_price - (atr * 3.0), 4)
 
             active_signals.append({'symbol': symbol, 'side': direction, 'entry': last_price, 'tp': tp, 'sl': stop})
             daily_report['total'] += 1
 
-            # PUANLI & MİNİMAL MESAJ
             return (
+                f"💎 <b>KriptoAlper v7 Sinyali</b>\n"
                 f"🚀 <b>#{symbol} {direction}</b>\n"
-                f"💵 Giriş: {last_price}\n"
-                f"💰 Hedef: {tp}\n"
+                f"--------------------------\n"
+                f"📉 Fiyat: {last_price}\n"
+                f"📊 Durum: Bant Dışı Dönüş Onaylı\n"
                 f"🛡️ Stop: {stop}\n"
+                f"💰 Hedef: {tp}\n"
                 f"⚡ <b>GÜVEN PUANI: %{score}</b>"
             )
     except: pass
@@ -137,7 +161,7 @@ def calc_signal(symbol):
 def run(token, chat):
     global TOKEN, CHAT_ID
     TOKEN, CHAT_ID = token, chat
-    tg_send("💎 <b>v6 ELITE MOD BAŞLADI</b>\nFiltre: Güven Puanı >= %85")
+    tg_send("🦅 <b>KriptoAlper v7 (FİNAL) Yayında!</b>\nStrateji: Bollinger + Yeşil Mum Onayı + Dinamik Puan")
     
     last_health_check = datetime.now()
 
@@ -146,9 +170,9 @@ def run(token, chat):
             check_results() 
             send_daily_summary() 
             
-            # 4 Saatte bir yaşam belirtisi
+            # 4 Saatte bir kontrol mesajı
             if datetime.now() - last_health_check > timedelta(hours=4):
-                tg_send("🟢 Sistem Çalışıyor...")
+                tg_send("👁️ v7 Nöbette | Bant Dışı Fırsat Bekleniyor...")
                 last_health_check = datetime.now()
 
             for sym in SYMBOLS:
@@ -159,4 +183,3 @@ def run(token, chat):
             time.sleep(60)
         except:
             time.sleep(60)
-
