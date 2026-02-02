@@ -14,13 +14,19 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TF = os.getenv("TF", "15m") 
 
-# Coin Listesini Biraz Daha Hareketli Coinlerle Güncelledim
+# --- GENİŞLETİLMİŞ LİSTE (TOP 60 HAREKETLİ COIN) ---
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-    "LTCUSDT","TRXUSDT","NEARUSDT","LINKUSDT","APTUSDT",
-    "SUIUSDT","OPUSDT","ARBUSDT","INJUSDT","TIAUSDT",
-    "FETUSDT","RNDRUSDT","PEPEUSDT","SEIUSDT","STXUSDT" 
+    # Majorler
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","TRXUSDT","DOTUSDT","LINKUSDT",
+    "MATICUSDT","LTCUSDT","BCHUSDT","UNIUSDT","ATOMUSDT","ETCUSDT","FILUSDT","NEARUSDT","ALGOUSDT",
+    # Yapay Zeka (AI)
+    "FETUSDT","RNDRUSDT","AGIXUSDT","WLDUSDT","GRTUSDT","OCEANUSDT","ARKMUSDT","AIUSDT",
+    # Meme Coinler (Volatilite Severler İçin)
+    "DOGEUSDT","SHIBUSDT","PEPEUSDT","FLOKIUSDT","BONKUSDT","WIFUSDT","MEMEUSDT","ORDIUSDT","1000SATSUSDT",
+    # Layer 1 & 2 & Popüler
+    "ARBUSDT","OPUSDT","SUIUSDT","APTUSDT","SEIUSDT","TIAUSDT","INJUSDT","STXUSDT","IMXUSDT","LDOUSDT",
+    "RUNEUSDT","FTMUSDT","SANDUSDT","MANAUSDT","AXSUSDT","GALAUSDT","CHZUSDT","EOSUSDT","KASUSDT","PYTHUSDT",
+    "JUPUSDT","DYDXUSDT","SNXUSDT"
 ]
 
 active_signals = [] 
@@ -89,7 +95,7 @@ def calc_signal(symbol):
         upper_band = bb['BBU_20_2.0'].iloc[-1]
         
         last_price = df['c'].iloc[-1]
-        real_open = df['o'].iloc[-1] # Mum rengi kontrolü için
+        real_open = df['o'].iloc[-1] 
         
         avg_vol = df['v'].rolling(20).mean().iloc[-1]
         curr_vol = df['v'].iloc[-1]
@@ -97,40 +103,32 @@ def calc_signal(symbol):
         direction = None
         score = 0
 
-        # --- GÜNCELLENMİŞ STRATEJİ (v7.1) ---
+        # --- STRATEJİ (v7.1 Devam Ediyor) ---
         
-        # LONG:
-        # 1. Fiyat Alt banda %0.5 yakın veya altında (Esnedi)
-        # 2. RSI < 45 (Önceki 40 idi, yumuşattık)
-        # 3. Mum Yeşil OLMAK ZORUNDA DEĞİL ama RSI artışta olmalı (Dönüş sinyali)
+        # LONG: Bant Dışı + RSI < 45 + RSI Yönü Yukarı
         if last_price <= lower_band * 1.005 and rsi < 45:
-             if rsi > prev_rsi: # RSI kafayı kaldırdıysa yeterli
+             if rsi > prev_rsi: 
                 direction = "LONG"
-                score = 65 # Taban puan
-                score += (45 - rsi) # RSI ne kadar düşükse puan artar
-                if last_price > real_open: score += 10 # Yeşil mumsa ekstra puan
+                score = 65 
+                score += (45 - rsi) 
+                if last_price > real_open: score += 10 
 
-        # SHORT:
-        # 1. Fiyat Üst banda %0.5 yakın veya üstünde
-        # 2. RSI > 55 (Önceki 60 idi, yumuşattık)
+        # SHORT: Bant Dışı + RSI > 55 + RSI Yönü Aşağı
         if last_price >= upper_band * 0.995 and rsi > 55:
-            if rsi < prev_rsi: # RSI kafayı indirdiyse yeterli
+            if rsi < prev_rsi: 
                 direction = "SHORT"
                 score = 65
                 score += (rsi - 55)
-                if last_price < real_open: score += 10 # Kırmızı mumsa ekstra puan
+                if last_price < real_open: score += 10 
 
         if direction:
-            # Hacim Bonusu
             if curr_vol > avg_vol: score += 5
             
-            # --- YENİ EŞİK: 70 ---
-            if score < 70: return None # 80'den 70'e çektik
+            if score < 70: return None # Eşik 70
             
             score = min(int(score), 100)
             if any(s['symbol'] == symbol for s in active_signals): return None
 
-            # Stop/TP
             stop = round(last_price - (atr * 2.0), 4) if direction == "LONG" else round(last_price + (atr * 2.0), 4)
             tp = round(last_price + (atr * 3.0), 4) if direction == "LONG" else round(last_price - (atr * 3.0), 4)
 
@@ -138,7 +136,7 @@ def calc_signal(symbol):
             daily_report['total'] += 1
 
             return (
-                f"⚡ <b>KriptoAlper v7.1 Sinyali</b>\n"
+                f"⚡ <b>KriptoAlper v7.2 (Geniş Ağ)</b>\n"
                 f"🚀 <b>#{symbol} {direction}</b>\n"
                 f"📉 Fiyat: {last_price}\n"
                 f"🛡️ Stop: {stop}\n"
@@ -151,8 +149,7 @@ def calc_signal(symbol):
 def run(token, chat):
     global TOKEN, CHAT_ID
     TOKEN, CHAT_ID = token, chat
-    # Başlangıç Mesajı (Botun çalıştığını teyit etmek için)
-    tg_send("✅ <b>SİSTEM BAŞLATILDI (v7.1)</b>\nFiltreler gevşetildi, tarama aktif.")
+    tg_send("🌍 <b>KriptoAlper v7.2 AKTİF!</b>\n60+ Coin Taranıyor. Geniş kapsamlı av başladı.")
     
     last_health_check = datetime.now()
 
@@ -162,14 +159,14 @@ def run(token, chat):
             send_daily_summary() 
             
             if datetime.now() - last_health_check > timedelta(hours=4):
-                tg_send("🟢 Tarama Devam Ediyor...")
+                tg_send("🟢 60 Coin Taranıyor | Sistem Aktif...")
                 last_health_check = datetime.now()
 
             for sym in SYMBOLS:
                 msg = calc_signal(sym)
                 if msg: tg_send(msg)
-                time.sleep(1.0) 
+                time.sleep(0.8) # Biraz hızlandırdık
 
-            time.sleep(60)
+            time.sleep(45) # Döngü süresini kısalttık
         except:
             time.sleep(60)
