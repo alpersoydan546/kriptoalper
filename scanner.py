@@ -152,7 +152,7 @@ def run(token, chat):
     global TOKEN, CHAT_ID
     TOKEN, CHAT_ID = token, chat
     # Başlangıç Mesajı (Botun çalıştığını teyit etmek için)
-    tg_send("✅ <b>SİSTEM BAŞLATILDI")
+    tg_send("✅ <b>SİSTEM BAŞLATILDI (v7.1)</b>\nFiltreler gevşetildi, tarama aktif.")
     
     last_health_check = datetime.now()
 
