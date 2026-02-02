@@ -14,16 +14,13 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TF = os.getenv("TF", "15m") 
 
-# --- GENİŞLETİLMİŞ LİSTE (TOP 60 HAREKETLİ COIN) ---
+# --- GENİŞLETİLMİŞ AV SAHASI (60 COIN) ---
+# LİSTE AYNI, DEĞİŞMEDİ
 SYMBOLS = [
-    # Majorler
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","TRXUSDT","DOTUSDT","LINKUSDT",
     "MATICUSDT","LTCUSDT","BCHUSDT","UNIUSDT","ATOMUSDT","ETCUSDT","FILUSDT","NEARUSDT","ALGOUSDT",
-    # Yapay Zeka (AI)
     "FETUSDT","RNDRUSDT","AGIXUSDT","WLDUSDT","GRTUSDT","OCEANUSDT","ARKMUSDT","AIUSDT",
-    # Meme Coinler (Volatilite Severler İçin)
     "DOGEUSDT","SHIBUSDT","PEPEUSDT","FLOKIUSDT","BONKUSDT","WIFUSDT","MEMEUSDT","ORDIUSDT","1000SATSUSDT",
-    # Layer 1 & 2 & Popüler
     "ARBUSDT","OPUSDT","SUIUSDT","APTUSDT","SEIUSDT","TIAUSDT","INJUSDT","STXUSDT","IMXUSDT","LDOUSDT",
     "RUNEUSDT","FTMUSDT","SANDUSDT","MANAUSDT","AXSUSDT","GALAUSDT","CHZUSDT","EOSUSDT","KASUSDT","PYTHUSDT",
     "JUPUSDT","DYDXUSDT","SNXUSDT"
@@ -56,18 +53,18 @@ def check_results():
         if current_data is None: continue
         last_price = current_data['c'].iloc[-1]
         
-        # TP
+        # --- TP: AV BAŞARILI ---
         if (sig['side'] == "LONG" and last_price >= sig['tp']) or \
            (sig['side'] == "SHORT" and last_price <= sig['tp']):
             daily_report['tp'] += 1
-            tg_send(f"✅ <b>TP VURULDU: #{sig['symbol']}</b>\nKasa Büyüyor! 💵")
+            tg_send(f"🦁 <b>AV BAŞARILI: #{sig['symbol']}</b> 🍖")
             active_signals.remove(sig)
             
-        # SL
+        # --- SL: AV KAÇTI ---
         elif (sig['side'] == "LONG" and last_price <= sig['sl']) or \
              (sig['side'] == "SHORT" and last_price >= sig['sl']):
             daily_report['sl'] += 1
-            tg_send(f"⚠️ <b>STOP: #{sig['symbol']}</b>\nRisk Kapatıldı. 🛡️")
+            tg_send(f"🐾 <b>AV KAÇTI: #{sig['symbol']}</b> 🩹")
             active_signals.remove(sig)
 
 def send_daily_summary():
@@ -75,7 +72,19 @@ def send_daily_summary():
     now = datetime.now()
     if now.date() > last_report_date:
         if daily_report['total'] > 0:
-            tg_send(f"📊 <b>GÜNLÜK:</b> {daily_report['tp']} TP | {daily_report['sl']} SL")
+            # --- GÜNLÜK RAPOR (SEÇENEK 2: AV ÇETELESİ) ---
+            yorum = "🦁 Sonuç: Aslan karnını doyurdu." if daily_report['tp'] >= daily_report['sl'] else "🦁 Sonuç: Aslan dinlenmeye çekildi."
+            
+            msg = (
+                f"🔥 <b>GÜNLÜK AV RAPORU</b>\n"
+                f"-------------------\n"
+                f"🍖 Yakalanan : {daily_report['tp']}\n"
+                f"🩹 Kaçan     : {daily_report['sl']}\n"
+                f"-------------------\n"
+                f"{yorum}"
+            )
+            tg_send(msg)
+            
         daily_report = {"tp": 0, "sl": 0, "total": 0}
         last_report_date = now.date()
 
@@ -85,7 +94,7 @@ def calc_signal(symbol):
         df = fetch_data(symbol, TF)
         if df is None or len(df) < 200: return None
 
-        # İNDİKATÖRLER
+        # İNDİKATÖRLER (MANTIK DEĞİŞMEDİ)
         rsi = ta.rsi(df['c'], length=14).iloc[-1]
         prev_rsi = ta.rsi(df['c'], length=14).iloc[-2]
         atr = ta.atr(df['h'], df['l'], df['c'], length=14).iloc[-1]
@@ -103,9 +112,8 @@ def calc_signal(symbol):
         direction = None
         score = 0
 
-        # --- STRATEJİ (v7.1 Devam Ediyor) ---
+        # --- STRATEJİ AYNI (Bant Dışı + RSI Dönüşü) ---
         
-        # LONG: Bant Dışı + RSI < 45 + RSI Yönü Yukarı
         if last_price <= lower_band * 1.005 and rsi < 45:
              if rsi > prev_rsi: 
                 direction = "LONG"
@@ -113,7 +121,6 @@ def calc_signal(symbol):
                 score += (45 - rsi) 
                 if last_price > real_open: score += 10 
 
-        # SHORT: Bant Dışı + RSI > 55 + RSI Yönü Aşağı
         if last_price >= upper_band * 0.995 and rsi > 55:
             if rsi < prev_rsi: 
                 direction = "SHORT"
@@ -124,7 +131,7 @@ def calc_signal(symbol):
         if direction:
             if curr_vol > avg_vol: score += 5
             
-            if score < 70: return None # Eşik 70
+            if score < 70: return None 
             
             score = min(int(score), 100)
             if any(s['symbol'] == symbol for s in active_signals): return None
@@ -135,13 +142,15 @@ def calc_signal(symbol):
             active_signals.append({'symbol': symbol, 'side': direction, 'entry': last_price, 'tp': tp, 'sl': stop})
             daily_report['total'] += 1
 
+            # --- SİNYAL MESAJI (SEÇENEK B - ASLAN HUD) ---
+            icon = "🟢" if direction == "LONG" else "🔴"
+            
             return (
-                f"⚡ <b>KriptoAlper v7.2 (Geniş Ağ)</b>\n"
-                f"🚀 <b>#{symbol} {direction}</b>\n"
-                f"📉 Fiyat: {last_price}\n"
-                f"🛡️ Stop: {stop}\n"
-                f"💰 Hedef: {tp}\n"
-                f"🔥 <b>GÜVEN PUANI: %{score}</b>"
+                f"🦁 <b>#{symbol} | {direction}</b> {icon}\n\n"
+                f"📍 {last_price} (Giriş)\n\n"
+                f"🎯 {tp}\n"
+                f"🛑 {stop}\n\n"
+                f"🔥 <b>Skor: %{score}</b>"
             )
     except: pass
     return None
@@ -149,7 +158,8 @@ def calc_signal(symbol):
 def run(token, chat):
     global TOKEN, CHAT_ID
     TOKEN, CHAT_ID = token, chat
-    tg_send("🌍 <b>KriptoAlper v7.2 AKTİF!</b>\n60+ Coin Taranıyor. Geniş kapsamlı av başladı.")
+    # --- BAŞLANGIÇ MESAJI (AV BAŞLADI) ---
+    tg_send("🦁 <b>KriptoAlper v7.2 Av Başladı</b>")
     
     last_health_check = datetime.now()
 
@@ -158,15 +168,16 @@ def run(token, chat):
             check_results() 
             send_daily_summary() 
             
+            # --- 4 SAATLİK NÖBET MESAJI (İZ SÜRÜCÜ) ---
             if datetime.now() - last_health_check > timedelta(hours=4):
-                tg_send("🟢 60 Coin Taranıyor | Sistem Aktif...")
+                tg_send("🐾 <b>İz Sürmeye Devam Ediyorum...</b>\n(Sessizlik hakim.)")
                 last_health_check = datetime.now()
 
             for sym in SYMBOLS:
                 msg = calc_signal(sym)
                 if msg: tg_send(msg)
-                time.sleep(0.8) # Biraz hızlandırdık
+                time.sleep(0.8) 
 
-            time.sleep(45) # Döngü süresini kısalttık
+            time.sleep(45) 
         except:
             time.sleep(60)
