@@ -1,26 +1,15 @@
-from flask import Flask
-from threading import Thread
 import ccxt
 import pandas as pd
 import pandas_ta as ta
 import time
 import requests
 import logging
-import os
 
-# --- FLASK AYARLARI (RENDER İÇİN GEREKLİ) ---
-app = Flask(__name__)
+# --- LOGLAMA ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
 
-@app.route('/')
-def home():
-    return "🦁 ASLAN BOT ÇALIŞIYOR - v8.4 AKTİF"
-
-def run_flask():
-    # Render'ın verdiği portu dinle, yoksa 8080 kullan
-    port = int(os.environ.get("PORT", 8080)) 
-    app.run(host='0.0.0.0', port=port)
-
-# --- BOT AYARLARI ---
+# --- AYARLAR ---
 SYMBOL_LIST = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
     'ADA/USDT', 'AVAX/USDT', 'TRX/USDT', 'LINK/USDT', 'MATIC/USDT',
@@ -33,27 +22,20 @@ SYMBOL_LIST = [
 ]
 
 TIMEFRAME = '15m'
-MIN_SCORE = 70  # Sadece %70 ve üzeri GÜÇLÜ sinyaller
-CHECK_INTERVAL = 300 # 5 Dakika
+MIN_SCORE = 70  # %70 Güven Skoru
+CHECK_INTERVAL = 300  # 5 Dakika bekleme
 
-# --- TELEGRAM AYARLARI ---
-TELEGRAM_TOKEN = "7939989932:AAFoR-x0_-x6XGg6wk4T-1Fw_xX7JgQo22U"
-TELEGRAM_CHAT_ID = "6046182181"
-
-# --- LOGLAMA ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger()
-
+# --- BİNANCE BAĞLANTISI ---
 exchange = ccxt.binance({
     'rateLimit': 1200,
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
-def send_telegram_message(message):
+def send_telegram_message(token, chat_id, message):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
         requests.post(url, data=data)
     except Exception as e:
         logger.error(f"Telegram hatası: {e}")
@@ -67,13 +49,11 @@ def calculate_indicators(df):
         df['EMA_50'] = ta.ema(df['close'], length=50)
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
         df['STOCH_K'] = stoch['STOCHk_14_3_3']
-        df['STOCH_D'] = stoch['STOCHd_14_3_3']
+        
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
         df['ADX'] = adx['ADX_14']
+        
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        bb = ta.bbands(df['close'], length=20, std=2)
-        df['BB_LOWER'] = bb['BBL_20_2.0']
-        df['BB_UPPER'] = bb['BBU_20_2.0']
         return df
     except:
         return df
@@ -102,9 +82,6 @@ def analyze_market(symbol):
         elif last['close'] < last['EMA_50']: score += 10
         
         if last['ADX'] > 20: score += 25
-        
-        if last['close'] < last['BB_LOWER']: score += 15
-        elif last['close'] > last['BB_UPPER']: score += 15
 
         if score >= MIN_SCORE:
             if last['RSI'] < 45 and last['MACD'] > last['MACD_SIGNAL']: signal = "LONG"
@@ -115,12 +92,14 @@ def analyze_market(symbol):
         logger.error(f"{symbol} hatası: {e}")
         return "ERROR", 0, 0, 0
 
-def bot_loop():
-    logger.info("🦁 ASLAN BOT v8.4 (Flask + Threading) BAŞLATILDI")
-    send_telegram_message("🦁 **ASLAN v8.4 DEVREDE!**\n\n🛡️ **Render Modu:** Aktif\n🎯 **Hedef:** %70 Güven Skoru\n🔥 **Bol Kazançlar!**")
+# --- BURASI KRİTİK! app.py BU FONKSİYONU ARIYOR ---
+def run(token, chat_id):
+    logger.info("🦁 ASLAN BOT BAŞLATILDI (Scanner Modu)")
+    send_telegram_message(token, chat_id, "🦁 **ASLAN BOT DEVREDE!**\n\n🎯 **Hedef:** %70+ Güven Skoru\n✅ **Sistem:** Stabil\n🚀 **Bol Kazançlar!**")
     
     while True:
         try:
+            logger.info("Piyasa taranıyor...")
             for symbol in SYMBOL_LIST:
                 signal, score, price, atr = analyze_market(symbol)
                 
@@ -140,22 +119,14 @@ def bot_loop():
                         f"🔥 **Skor:** %{score}\n"
                         f"⚠️ _Manuel Giriş Yap!_"
                     )
-                    send_telegram_message(msg)
+                    send_telegram_message(token, chat_id, msg)
                     logger.info(f"SİNYAL: {symbol} Skor: {score}")
                 
                 time.sleep(1) # API limit koruma
             
-            logger.info("Tarama bitti, bekleniyor...")
+            logger.info("Bekleniyor...")
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
             logger.error(f"Bot Döngü Hatası: {e}")
             time.sleep(10)
-
-if __name__ == "__main__":
-    # Botu ayrı bir iş parçacığında (Thread) başlat
-    t = Thread(target=bot_loop)
-    t.start()
-    
-    # Flask sunucusunu başlat (Render'ın portu görmesi için)
-    run_flask()
