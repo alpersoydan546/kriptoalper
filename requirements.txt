@@ -1,5 +1,6 @@
 flask
-requests
+ccxt
 pandas
 pandas_ta
+requests
 gunicorn
