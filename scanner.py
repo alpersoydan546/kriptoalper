@@ -6,42 +6,22 @@ import requests
 import logging
 import json
 import os
-from threading import Thread
+import threading
 from datetime import datetime
 from flask import Flask
 
-# --- AYARLAR ---
-SYMBOL_LIST = [
-    # --- MAJORS (Demirbaşlar) ---
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', # Senin eski dost :)
-    'BNB/USDT', 'AVAX/USDT', 'LINK/USDT',
-    
-    # --- MEME COINS (Volatilite Kralları) ---
-    'DOGE/USDT', 'PEPE/USDT', 'WIF/USDT', 'BONK/USDT', 'FLOKI/USDT',
-    
-    # --- YENİ YILDIZLAR (Trend & Hacim) ---
-    'SUI/USDT', 'SEI/USDT', 'TIA/USDT', 'APT/USDT',
-    'ORDI/USDT', 'PYTH/USDT', 'ONDO/USDT', 'JUP/USDT',
-    'PENDLE/USDT', 'ENS/USDT',
-    
-    # --- AI & RWA (Yapay Zeka & Teknoloji) ---
-    'RNDR/USDT', 'FET/USDT', 'WLD/USDT', 'NEAR/USDT',
-    
-    # --- KATMAN 2 (Hızlılar) ---
-    'ARB/USDT', 'OP/USDT', 'IMX/USDT', 'STX/USDT',
-    
-    # --- HAREKETLİ OYUNCULAR ---
-    'TRX/USDT', 'GALA/USDT', 'INJ/USDT', 'LDO/USDT'
-]
+# --- [ SCALPER AYARLARI ] ---
+TIMEFRAME = '15m'          # Scalp için ideal
+LOOKBACK = 100             # Çok derin geçmişe gerek yok, anlık bakıyoruz
+SCAN_INTERVAL = 45         # Daha sık tarasın (45 saniye)
+TRADE_CHECK_INTERVAL = 5   # Açık işlemleri 5 saniyede bir kontrol et
+STATS_FILE = "daily_stats_render.json"  # Dosya ismi farklı olsun karışmasın
+TRADES_FILE = "active_trades_render.json"
 
-TIMEFRAME = '15m'       
-LOOKBACK = 50           
-CHECK_INTERVAL = 300    
-HEARTBEAT_INTERVAL = 1800 
-TRADES_FILE = "active_trades.json"
-STATS_FILE = "daily_stats.json"
+# Sadece Hacimli "Baba" Coinler (Vurkaç için en güvenlileri)
+SCALP_COINS = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT']
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
 exchange = ccxt.binance({
@@ -51,41 +31,39 @@ exchange = ccxt.binance({
 })
 
 app = Flask(__name__)
+lock = threading.Lock()
 
 @app.route('/')
-def home():
-    return "🦁 ASLAN v10.1 ONLINE - GÜNCEL KADRO"
+def home(): return "🦁 KRİPTOALPER v16.0 - PİRANHA (SCALPER) AKTİF"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    try:
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host='0.0.0.0', port=port)
+    except: pass
 
-def send_telegram_message(token, chat_id, message):
+def send_telegram(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, data=data)
-    except Exception as e:
-        logger.error(f"Telegram hatası: {e}")
+        requests.post(url, data=data, timeout=10)
+    except Exception as e: logger.error(f"Telegram Hatası: {e}")
 
-# --- DOSYA İŞLEMLERİ ---
+# --- [ DOSYA SİSTEMİ ] ---
 def load_json(filename):
-    try:
-        if os.path.exists(filename):
-            with open(filename, 'r') as f:
-                return json.load(f)
-        return {}
-    except:
-        return {}
+    with lock:
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r') as f: return json.load(f)
+            return {}
+        except: return {}
 
 def save_json(filename, data):
-    try:
-        with open(filename, 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
+    with lock:
+        try:
+            with open(filename, 'w') as f: json.dump(data, f, indent=4)
+        except: pass
 
-# --- GÜNLÜK İSTATİSTİK ---
 def update_stats(result, pnl):
     stats = load_json(STATS_FILE)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -101,145 +79,176 @@ def send_daily_report(token, chat_id):
     stats = load_json(STATS_FILE)
     today = datetime.now().strftime("%Y-%m-%d")
     if stats.get("date") != today: return
-        
-    # GÜNLÜK RAPOR - SEÇENEK 1
+    
     msg = (
-        f"📅 **GÜNLÜK RAPOR**\n\n"
+        f"☁️ **RENDER (SCALP) RAPORU**\n\n"
         f"✅ **Başarılı:** {stats['win']}\n"
         f"❌ **Başarısız:** {stats['loss']}\n\n"
         f"💰 **Net PnL:** %{stats['pnl']:.2f}"
     )
-    send_telegram_message(token, chat_id, msg)
+    send_telegram(token, chat_id, msg)
 
-# --- MİMAR ANALİZİ ---
-def analyze_price_action(symbol):
+# --- [ BEKÇİ MODÜLÜ (SCALP TAKİP) ] ---
+def monitor_trades_thread(token, chat_id):
+    logger.info("🛡️ SCALP BEKÇİSİ AKTİF")
+    while True:
+        try:
+            trades = load_json(TRADES_FILE)
+            if not trades:
+                time.sleep(TRADE_CHECK_INTERVAL)
+                continue
+
+            updated_trades = trades.copy()
+            trades_changed = False
+
+            for symbol, trade in trades.items():
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    
+                    # KAR AL (TP)
+                    if (trade['signal'] == "LONG" and current_price >= trade['tp']) or \
+                       (trade['signal'] == "SHORT" and current_price <= trade['tp']):
+                        
+                        pnl = abs((current_price - trade['entry']) / trade['entry']) * 100
+                        msg = (f"✅ **{symbol.replace('/USDT', '')} | HEDEF**\n"
+                               f"☁️ Scalp Başarılı\n\n"
+                               f"💰 **Kâr:** +%{pnl:.2f}\n"
+                               f"💵 **Fiyat:** {current_price}")
+                        send_telegram(token, chat_id, msg)
+                        update_stats("WIN", pnl)
+                        del updated_trades[symbol]
+                        trades_changed = True
+                    
+                    # ZARAR DURDUR (SL)
+                    elif (trade['signal'] == "LONG" and current_price <= trade['sl']) or \
+                         (trade['signal'] == "SHORT" and current_price >= trade['sl']):
+                        
+                        loss = abs((current_price - trade['entry']) / trade['entry']) * 100
+                        msg = (f"❌ **{symbol.replace('/USDT', '')} | STOP**\n"
+                               f"☁️ Scalp Stop\n\n"
+                               f"📉 **Zarar:** -%{loss:.2f}\n"
+                               f"💵 **Fiyat:** {current_price}")
+                        send_telegram(token, chat_id, msg)
+                        update_stats("LOSS", -loss)
+                        del updated_trades[symbol]
+                        trades_changed = True
+                        
+                except: continue
+            
+            if trades_changed:
+                save_json(TRADES_FILE, updated_trades)
+
+        except: pass
+        time.sleep(TRADE_CHECK_INTERVAL)
+
+# --- [ PİRANHA STRATEJİSİ (BOLLINGER + RSI) ] ---
+def analyze_scalp(symbol):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LOOKBACK)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        if len(df) < 25: return "NEUTRAL", 0, 0, 0, 0
+
         current_price = df['close'].iloc[-1]
         
-        support = df['low'].min()
-        resistance = df['high'].max()
+        # Bollinger Bantları (20, 2)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        lower_band = bb['BBL_20_2.0'].iloc[-1]
+        upper_band = bb['BBU_20_2.0'].iloc[-1]
+        middle_band = bb['BBM_20_2.0'].iloc[-1]
+        
         rsi = ta.rsi(df['close'], length=14).iloc[-1]
         
-        signal = "NEUTRAL"
-        tp = 0; sl = 0; score = 50 
-        
-        dist_to_support = (current_price - support) / support * 100
-        dist_to_resistance = (resistance - current_price) / current_price * 100
-        
-        # LONG KURALLARI
-        if dist_to_support < 3 and rsi < 50: 
+        signal = "NEUTRAL"; tp = 0; sl = 0; score = 50
+
+        # --- LONG STRATEJİSİ ---
+        # Fiyat Alt Banda çarptıysa VE RSI aşırı satımdaysa (<35) -> TEPKİ ALIMI
+        if current_price <= lower_band and rsi < 35:
             signal = "LONG"
-            sl = support * 0.995 
-            tp = resistance * 0.99 
-            score += (50 - rsi) + ((3 - dist_to_support) * 5)
+            # Hedef: Orta Bant (Mean Reversion)
+            tp = middle_band 
+            # Stop: Alt bandın %0.8 altı (Çok yakın stop)
+            sl = lower_band * 0.992
             
-        # SHORT KURALLARI
-        elif dist_to_resistance < 3 and rsi > 50:
+            score = 80 + (35 - rsi) # RSI ne kadar düşükse puan artar
+
+        # --- SHORT STRATEJİSİ ---
+        # Fiyat Üst Banda çarptıysa VE RSI aşırı alımdaysa (>65) -> TEPKİ SATIŞI
+        elif current_price >= upper_band and rsi > 65:
             signal = "SHORT"
-            sl = resistance * 1.005 
-            tp = support * 1.01 
-            score += (rsi - 50) + ((3 - dist_to_resistance) * 5)
+            # Hedef: Orta Bant
+            tp = middle_band
+            # Stop: Üst bandın %0.8 üstü
+            sl = upper_band * 1.008
             
-        if signal != "NEUTRAL":
-            risk = abs(current_price - sl)
-            reward = abs(tp - current_price)
-            if reward < (risk * 1.5): return "NEUTRAL", 0, 0, 0, 0
-        
-        score = min(score, 99)
-        return signal, current_price, tp, sl, int(score)
+            score = 80 + (rsi - 65) # RSI ne kadar yüksekse puan artar
+
+        return signal, current_price, tp, sl, min(int(score), 99)
     except:
         return "ERROR", 0, 0, 0, 0
 
-def check_active_trades(token, chat_id):
-    trades = load_json(TRADES_FILE)
-    if not trades: return
-    updated_trades = trades.copy()
-    
-    for symbol, trade in trades.items():
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker['last']
-            
-            # SONUÇ MESAJI - SEÇENEK 1 (DİKEY NET)
-            if (trade['signal'] == "LONG" and price >= trade['tp']) or \
-               (trade['signal'] == "SHORT" and price <= trade['tp']):
-                pnl = abs((price - trade['entry']) / trade['entry']) * 100
-                msg = (
-                    f"✅ **{symbol.replace('/USDT', '')} | HEDEF**\n\n"
-                    f"💰 **Kâr:** +%{pnl:.2f}\n"
-                    f"💵 **Fiyat:** {price}"
-                )
-                send_telegram_message(token, chat_id, msg)
-                update_stats("WIN", pnl)
-                del updated_trades[symbol]
-                
-            elif (trade['signal'] == "LONG" and price <= trade['sl']) or \
-                 (trade['signal'] == "SHORT" and price >= trade['sl']):
-                loss = abs((price - trade['entry']) / trade['entry']) * 100
-                msg = (
-                    f"❌ **{symbol.replace('/USDT', '')} | STOP**\n\n"
-                    f"📉 **Zarar:** -%{loss:.2f}\n"
-                    f"💵 **Fiyat:** {price}"
-                )
-                send_telegram_message(token, chat_id, msg)
-                update_stats("LOSS", -loss)
-                del updated_trades[symbol]
-        except:
-            continue
-    save_json(TRADES_FILE, updated_trades)
-
+# --- [ ANA DÖNGÜ ] ---
 def bot_loop(token, chat_id):
-    logger.info("🦁 ASLAN v10.1 BAŞLATILDI")
-    # BAŞLANGIÇ - SEÇENEK 1
-    send_telegram_message(token, chat_id, "Sistem Online 🟢\nv10.1 (Güncel Kadro)\nBinance Bağlantısı: ✅")
+    # Bekçi ve Flask Başlat
+    threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    logger.info("🦁 PİRANHA (RENDER) SAHADA")
+    send_telegram(token, chat_id, "☁️ **Render Scalper Online**\n\n⚡ Mod: Bollinger Tepki (Vur-Kaç)\n🎯 Hedef: Orta Bant\n🛡️ Stop: Çok Sıkı")
     
     last_heartbeat = time.time()
     last_report_date = datetime.now().day
-    
+
     while True:
         try:
-            check_active_trades(token, chat_id)
-            trades = load_json(TRADES_FILE)
-            
-            # NABIZ - SEÇENEK 1 (SADE)
-            if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-                send_telegram_message(token, chat_id, "💓 **Sistem Aktif**\n_Tarama sürüyor..._")
+            # Nabız (Bulut Emojisi ile)
+            if time.time() - last_heartbeat > 1800:
+                send_telegram(token, chat_id, "☁️ **Render Aktif**\n_Fırsat kolluyorum..._")
                 last_heartbeat = time.time()
-            
-            current_day = datetime.now().day
-            if current_day != last_report_date:
-                send_daily_report(token, chat_id)
-                last_report_date = current_day
 
-            for symbol in SYMBOL_LIST:
-                if symbol in trades: continue
-                
-                signal, price, tp, sl, score = analyze_price_action(symbol)
-                
-                if signal in ["LONG", "SHORT"]:
-                    emoji = "🟢" if signal == "LONG" else "🔴"
-                    # SİNYAL - SEÇENEK 7 (MODERN DİKEY + SKOR)
-                    msg = (
-                        f"🦁 **#{symbol.replace('/USDT', '')}**\n"
-                        f"{emoji} **{signal}**\n\n"
-                        f"📍 **{price}**\n"
-                        f"🎯 **{tp:.4f}**\n"
-                        f"🛡️ **{sl:.4f}**\n"
-                        f"💎 **%{score}**"
-                    )
-                    send_telegram_message(token, chat_id, msg)
+            # Gün Sonu Raporu
+            if datetime.now().day != last_report_date:
+                send_daily_report(token, chat_id)
+                last_report_date = datetime.now().day
+
+            trades = load_json(TRADES_FILE)
+
+            # Sadece seçili SCALP coinlerini tara
+            for symbol in SCALP_COINS:
+                if symbol in trades: continue 
+
+                signal, price, tp, sl, score = analyze_scalp(symbol)
+
+                # Scalp için %80 üzeri güven arıyoruz (Bant dışına taşma şartı)
+                if signal in ["LONG", "SHORT"] and score >= 80:
+                    
+                    emoji = "🟢 LONG" if signal == "LONG" else "🔴 SHORT"
+                    
+                    # Mesaj Formatı (BİLGİSAYARLA AYNI, SADECE İKON FARKLI ☁️)
+                    msg = (f"🦁 **#{symbol.replace('/USDT', '')} | ☁️**\n"
+                           f"{emoji}\n\n"
+                           f"📍 **{price}**\n"
+                           f"🎯 **{tp:.4f}**\n"
+                           f"🛡️ **{sl:.4f}**\n"
+                           f"💎 **Güven: %{score}**\n"
+                           f"⚡ **Bollinger Tepkisi**")
+                    
+                    send_telegram(token, chat_id, msg)
+                    
                     trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
                     save_json(TRADES_FILE, trades)
+                    
                     time.sleep(1)
-            time.sleep(CHECK_INTERVAL)
+
+            time.sleep(SCAN_INTERVAL) # 45 saniyede bir tara
+
         except Exception as e:
             logger.error(f"Hata: {e}")
             time.sleep(10)
 
-def run(token, chat_id):
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    bot_loop(token, chat_id)
+if __name__ == "__main__":
+    MY_TOKEN = "BURAYA_TOKENINI_YAPISTIR"
+    MY_ID = "BURAYA_ID_YAPISTIR"
+    
+    bot_loop(MY_TOKEN, MY_ID)
