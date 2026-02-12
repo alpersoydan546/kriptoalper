@@ -12,14 +12,26 @@ from flask import Flask
 
 # --- AYARLAR ---
 SYMBOL_LIST = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
-    'ADA/USDT', 'AVAX/USDT', 'TRX/USDT', 'LINK/USDT', 'MATIC/USDT',
-    'DOT/USDT', 'LTC/USDT', 'BCH/USDT', 'ATOM/USDT', 'UNI/USDT',
-    'FIL/USDT', 'IMX/USDT', 'APT/USDT', 'OP/USDT', 'ARB/USDT',
-    'PEPE/USDT', 'RNDR/USDT', 'INJ/USDT', 'NEAR/USDT', 'STX/USDT',
-    'FET/USDT', 'GALA/USDT', 'WIF/USDT', 'JUP/USDT', 'BONK/USDT',
-    'FLOKI/USDT', 'SEI/USDT', 'SUI/USDT', 'TIA/USDT', 'LDO/USDT',
-    'EOS/USDT', 'ALGO/USDT'
+    # --- MAJORS (Demirbaşlar) ---
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', # Senin eski dost :)
+    'BNB/USDT', 'AVAX/USDT', 'LINK/USDT',
+    
+    # --- MEME COINS (Volatilite Kralları) ---
+    'DOGE/USDT', 'PEPE/USDT', 'WIF/USDT', 'BONK/USDT', 'FLOKI/USDT',
+    
+    # --- YENİ YILDIZLAR (Trend & Hacim) ---
+    'SUI/USDT', 'SEI/USDT', 'TIA/USDT', 'APT/USDT',
+    'ORDI/USDT', 'PYTH/USDT', 'ONDO/USDT', 'JUP/USDT',
+    'PENDLE/USDT', 'ENS/USDT',
+    
+    # --- AI & RWA (Yapay Zeka & Teknoloji) ---
+    'RNDR/USDT', 'FET/USDT', 'WLD/USDT', 'NEAR/USDT',
+    
+    # --- KATMAN 2 (Hızlılar) ---
+    'ARB/USDT', 'OP/USDT', 'IMX/USDT', 'STX/USDT',
+    
+    # --- HAREKETLİ OYUNCULAR ---
+    'TRX/USDT', 'GALA/USDT', 'INJ/USDT', 'LDO/USDT'
 ]
 
 TIMEFRAME = '15m'       
@@ -42,7 +54,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🦁 ASLAN v10.0 ONLINE"
+    return "🦁 ASLAN v10.1 ONLINE - GÜNCEL KADRO"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -179,9 +191,9 @@ def check_active_trades(token, chat_id):
     save_json(TRADES_FILE, updated_trades)
 
 def bot_loop(token, chat_id):
-    logger.info("🦁 ASLAN v10.0 BAŞLATILDI")
+    logger.info("🦁 ASLAN v10.1 BAŞLATILDI")
     # BAŞLANGIÇ - SEÇENEK 1
-    send_telegram_message(token, chat_id, "Sistem Online 🟢\nv10.0 (Mimar)\nBinance Bağlantısı: ✅")
+    send_telegram_message(token, chat_id, "Sistem Online 🟢\nv10.1 (Güncel Kadro)\nBinance Bağlantısı: ✅")
     
     last_heartbeat = time.time()
     last_report_date = datetime.now().day
