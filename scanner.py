@@ -23,9 +23,9 @@ SYMBOL_LIST = [
 
 TIMEFRAME = '15m'       # Giriş Sinyali
 TREND_TIMEFRAME = '1h'  # Trend Teyidi
-MIN_SCORE = 65          # Baraj Puanı
-CHECK_INTERVAL = 300    # 5 Dakika Arayla Tara
-HEARTBEAT_INTERVAL = 1800 # 30 Dakikada bir "Çalışıyorum" mesajı at
+MIN_SCORE = 55          # BARAJ DÜŞÜRÜLDÜ (Daha fazla işlem)
+CHECK_INTERVAL = 300    # 5 Dakika
+HEARTBEAT_INTERVAL = 1800 # 30 Dakikada bir Nabız
 TRADES_FILE = "active_trades.json"
 
 # --- LOGLAMA ---
@@ -42,7 +42,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🦁 ASLAN v9.1 - NABIZ SİSTEMİ AKTİF"
+    return "🦁 ASLAN v9.2 - AGRESİF MOD AKTİF"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -108,15 +108,19 @@ def check_active_trades(token, chat_id):
             ticker = exchange.fetch_ticker(symbol)
             price = ticker['last']
             
+            # KÂR ALMA
             if (trade['signal'] == "LONG" and price >= trade['tp']) or \
                (trade['signal'] == "SHORT" and price <= trade['tp']):
-                msg = f"🦁 **AV BAŞARILI!** 🟢\n\n**#{symbol.replace('/USDT', '')}** Hedefe ulaştı.\n💰 **Fiyat:** {price}"
+                pnl = abs((price - trade['entry']) / trade['entry']) * 100
+                msg = f"🦁 **AV BAŞARILI!** 🟢\n\n**#{symbol.replace('/USDT', '')}** Hedefe vurdu!\n💰 **Kâr:** %{pnl:.2f}\n💵 **Fiyat:** {price}"
                 send_telegram_message(token, chat_id, msg)
                 del updated_trades[symbol]
                 
+            # STOP OLMA
             elif (trade['signal'] == "LONG" and price <= trade['sl']) or \
                  (trade['signal'] == "SHORT" and price >= trade['sl']):
-                msg = f"🦁 **AV KAÇTI** 🔴\n\n**#{symbol.replace('/USDT', '')}** Stop oldu.\n📉 **Fiyat:** {price}"
+                loss = abs((price - trade['entry']) / trade['entry']) * 100
+                msg = f"🦁 **AV KAÇTI** 🔴\n\n**#{symbol.replace('/USDT', '')}** Stop oldu.\n📉 **Zarar:** %{loss:.2f}\n💵 **Fiyat:** {price}"
                 send_telegram_message(token, chat_id, msg)
                 del updated_trades[symbol]
         except:
@@ -132,6 +136,7 @@ def analyze_market(symbol):
         score = 0
         signal = "NEUTRAL"
         
+        # Puanlama
         if last['RSI'] < 35: score += 20
         elif last['RSI'] > 65: score += 20
         if last['MACD'] > last['MACD_SIGNAL']: score += 15
@@ -142,22 +147,26 @@ def analyze_market(symbol):
         elif last['close'] < last['EMA_50']: score += 10
         if last['ADX'] > 20: score += 25
 
-        if score >= 50:
+        # Sinyal Yönü
+        if score >= 40: # Temel sinyal varsa yön belirle
             if last['RSI'] < 45 and last['MACD'] > last['MACD_SIGNAL']: signal = "LONG"
             elif last['RSI'] > 55 and last['MACD'] < last['MACD_SIGNAL']: signal = "SHORT"
         
+        # TREND FİLTRESİ (Gevşetilmiş)
         if signal in ["LONG", "SHORT"]:
             trend = get_trend_direction(symbol)
-            if trend == signal: score += 10
-            else: score -= 25
+            if trend == signal: 
+                score += 15 # Trend bizden yana, Puan artır
+            else: 
+                score -= 10 # Trend ters, ama sadece 10 puan kır (Eskiden 25'ti)
             
         return signal, score, last['close'], last['ATR']
     except:
         return "ERROR", 0, 0, 0
 
 def bot_loop(token, chat_id):
-    logger.info("🦁 ASLAN v9.1 BAŞLATILDI")
-    send_telegram_message(token, chat_id, "🦁 **ASLAN v9.1 AKTİF!**\n\n💓 **Nabız Sistemi:** Açık (30dk)\n🛡️ **Trend Filtresi:** Açık\n🚀 **Başarılar Alperen!**")
+    logger.info("🦁 ASLAN v9.2 BAŞLATILDI")
+    send_telegram_message(token, chat_id, "🦁 **ASLAN v9.2 (AGRESİF) DEVREDE!**\n\n⚡ **Baraj:** 55 Puan\n🛡️ **Filtre:** Hafifletildi\n🚀 **Bol Kazançlar Alperen!**")
     
     last_heartbeat = time.time()
     
@@ -166,15 +175,16 @@ def bot_loop(token, chat_id):
             check_active_trades(token, chat_id)
             trades = load_trades()
             
-            # NABIZ KONTROLÜ (HEARTBEAT)
+            # Nabız Mesajı
             if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-                send_telegram_message(token, chat_id, "🦁 **Aslan Nöbette...**\nSistem sorunsuz çalışıyor, tarama devam ediyor. ⏳")
+                send_telegram_message(token, chat_id, "🦁 **Aslan Nöbette...**\nSistem aktif, tarama sürüyor. ⏳")
                 last_heartbeat = time.time()
             
             for symbol in SYMBOL_LIST:
                 if symbol in trades: continue
                 signal, score, price, atr = analyze_market(symbol)
                 
+                # BARAJ 55 OLDU (Musluklar Açıldı)
                 if score >= MIN_SCORE and signal in ["LONG", "SHORT"]:
                     sl = price - (atr * 1.5) if signal == "LONG" else price + (atr * 1.5)
                     tp = price + (atr * 3.0) if signal == "LONG" else price - (atr * 3.0)
@@ -185,7 +195,8 @@ def bot_loop(token, chat_id):
                         f"📍 **Giriş:** {price:.4f}\n"
                         f"🎯 **Hedef:** {tp:.4f}\n"
                         f"🛑 **Stop:** {sl:.4f}\n"
-                        f"🔥 **Skor:** %{score}"
+                        f"🔥 **Skor:** %{score}\n"
+                        f"⚠️ _Binance'ten Takip Et!_"
                     )
                     send_telegram_message(token, chat_id, msg)
                     trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
