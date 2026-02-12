@@ -21,14 +21,12 @@ SYMBOL_LIST = [
     'EOS/USDT', 'ALGO/USDT'
 ]
 
-TIMEFRAME = '15m'       # Giriş Sinyali
-TREND_TIMEFRAME = '1h'  # Trend Teyidi
-MIN_SCORE = 55          # BARAJ DÜŞÜRÜLDÜ (Daha fazla işlem)
+TIMEFRAME = '15m'       # Analiz Zamanı
+LOOKBACK = 50           # Geriye dönük kaç muma bakıp destek/direnç çizecek?
 CHECK_INTERVAL = 300    # 5 Dakika
-HEARTBEAT_INTERVAL = 1800 # 30 Dakikada bir Nabız
+HEARTBEAT_INTERVAL = 1800 
 TRADES_FILE = "active_trades.json"
 
-# --- LOGLAMA ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
@@ -42,7 +40,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🦁 ASLAN v9.2 - AGRESİF MOD AKTİF"
+    return "🦁 ASLAN v10.0 - MİMAR MODU AKTİF"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -72,31 +70,59 @@ def save_trades(trades):
     except:
         pass
 
-def calculate_indicators(df):
+# --- MİMAR ANALİZİ (Price Action) ---
+def analyze_price_action(symbol):
     try:
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        df['MACD'] = macd['MACD_12_26_9']
-        df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
-        df['EMA_50'] = ta.ema(df['close'], length=50)
-        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
-        df['STOCH_K'] = stoch['STOCHk_14_3_3']
-        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['ADX'] = adx['ADX_14']
-        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        return df
-    except:
-        return df
-
-def get_trend_direction(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=60)
+        # Son 50 mumu çek
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LOOKBACK)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        ema_50 = ta.ema(df['close'], length=50).iloc[-1]
-        if df['close'].iloc[-1] > ema_50: return "LONG"
-        else: return "SHORT"
-    except:
-        return "NEUTRAL"
+        
+        current_price = df['close'].iloc[-1]
+        
+        # DESTEK (Swing Low) ve DİRENÇ (Swing High) Bul
+        # Son 50 mumun en düşüğü ve en yükseği
+        support = df['low'].min()
+        resistance = df['high'].max()
+        
+        # RSI Kontrolü (Aşırı alım/satım var mı?)
+        rsi = ta.rsi(df['close'], length=14).iloc[-1]
+        
+        signal = "NEUTRAL"
+        tp = 0
+        sl = 0
+        
+        # STRATEJİ: Fiyat Desteğe Yakınsa AL, Dirence Yakınsa SAT
+        # Destekten %2 yukarıdaysa hala "Destek Bölgesi" sayılır.
+        
+        dist_to_support = (current_price - support) / support * 100
+        dist_to_resistance = (resistance - current_price) / current_price * 100
+        
+        # LONG SENARYOSU (Destekten Dönüş)
+        # Fiyat desteğe %3 kadar yakınsa VE RSI < 45 ise (Henüz şişmemişse)
+        if dist_to_support < 3 and rsi < 45: 
+            signal = "LONG"
+            sl = support * 0.995 # Stopu desteğin HAFİF altına koy (%0.5 altı)
+            tp = resistance * 0.99 # Hedefi direncin HAFİF altına koy
+            
+        # SHORT SENARYOSU (Dirençten Dönüş)
+        # Fiyat dirence %3 kadar yakınsa VE RSI > 55 ise
+        elif dist_to_resistance < 3 and rsi > 55:
+            signal = "SHORT"
+            sl = resistance * 1.005 # Stopu direncin HAFİF üstüne koy
+            tp = support * 1.01 # Hedefi desteğin HAFİF üstüne koy
+            
+        # RİSK / KAZANÇ KONTROLÜ (Risk Reward Ratio)
+        # Eğer Kazanç potansiyeli, Riskten büyük değilse girme!
+        if signal != "NEUTRAL":
+            risk = abs(current_price - sl)
+            reward = abs(tp - current_price)
+            if reward < (risk * 1.5): # En az 1.5 kat kazanç vaat etmeli
+                return "NEUTRAL", 0, 0, 0
+        
+        return signal, current_price, tp, sl
+
+    except Exception:
+        return "ERROR", 0, 0, 0
 
 def check_active_trades(token, chat_id):
     trades = load_trades()
@@ -111,62 +137,25 @@ def check_active_trades(token, chat_id):
             # KÂR ALMA
             if (trade['signal'] == "LONG" and price >= trade['tp']) or \
                (trade['signal'] == "SHORT" and price <= trade['tp']):
-                pnl = abs((price - trade['entry']) / trade['entry']) * 100
-                msg = f"🦁 **AV BAŞARILI!** 🟢\n\n**#{symbol.replace('/USDT', '')}** Hedefe vurdu!\n💰 **Kâr:** %{pnl:.2f}\n💵 **Fiyat:** {price}"
+                # MİNİMAL SONUÇ MESAJI
+                msg = f"🦁 **{symbol.replace('/USDT', '')}** ✅ HEDEF GELDİ\n💰 **Fiyat:** {price}"
                 send_telegram_message(token, chat_id, msg)
                 del updated_trades[symbol]
                 
             # STOP OLMA
             elif (trade['signal'] == "LONG" and price <= trade['sl']) or \
                  (trade['signal'] == "SHORT" and price >= trade['sl']):
-                loss = abs((price - trade['entry']) / trade['entry']) * 100
-                msg = f"🦁 **AV KAÇTI** 🔴\n\n**#{symbol.replace('/USDT', '')}** Stop oldu.\n📉 **Zarar:** %{loss:.2f}\n💵 **Fiyat:** {price}"
+                # MİNİMAL SONUÇ MESAJI
+                msg = f"🦁 **{symbol.replace('/USDT', '')}** ❌ STOP OLDU\n📉 **Fiyat:** {price}"
                 send_telegram_message(token, chat_id, msg)
                 del updated_trades[symbol]
         except:
             continue
     save_trades(updated_trades)
 
-def analyze_market(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
-        last = df.iloc[-1]
-        score = 0
-        signal = "NEUTRAL"
-        
-        # Puanlama
-        if last['RSI'] < 35: score += 20
-        elif last['RSI'] > 65: score += 20
-        if last['MACD'] > last['MACD_SIGNAL']: score += 15
-        elif last['MACD'] < last['MACD_SIGNAL']: score += 15
-        if last['STOCH_K'] < 20: score += 15
-        elif last['STOCH_K'] > 80: score += 15
-        if last['close'] > last['EMA_50']: score += 10
-        elif last['close'] < last['EMA_50']: score += 10
-        if last['ADX'] > 20: score += 25
-
-        # Sinyal Yönü
-        if score >= 40: # Temel sinyal varsa yön belirle
-            if last['RSI'] < 45 and last['MACD'] > last['MACD_SIGNAL']: signal = "LONG"
-            elif last['RSI'] > 55 and last['MACD'] < last['MACD_SIGNAL']: signal = "SHORT"
-        
-        # TREND FİLTRESİ (Gevşetilmiş)
-        if signal in ["LONG", "SHORT"]:
-            trend = get_trend_direction(symbol)
-            if trend == signal: 
-                score += 15 # Trend bizden yana, Puan artır
-            else: 
-                score -= 10 # Trend ters, ama sadece 10 puan kır (Eskiden 25'ti)
-            
-        return signal, score, last['close'], last['ATR']
-    except:
-        return "ERROR", 0, 0, 0
-
 def bot_loop(token, chat_id):
-    logger.info("🦁 ASLAN v9.2 BAŞLATILDI")
-    send_telegram_message(token, chat_id, "🦁 **ASLAN v9.2 (AGRESİF) DEVREDE!**\n\n⚡ **Baraj:** 55 Puan\n🛡️ **Filtre:** Hafifletildi\n🚀 **Bol Kazançlar Alperen!**")
+    logger.info("🦁 ASLAN v10.0 BAŞLATILDI")
+    send_telegram_message(token, chat_id, "🦁 **ASLAN v10.0 (MİMAR)**\n🏗️ Destek/Direnç Analizi: Aktif\n⏳ Mesajlar: Minimal\n🚀 Başarılar Alperen!")
     
     last_heartbeat = time.time()
     
@@ -175,29 +164,26 @@ def bot_loop(token, chat_id):
             check_active_trades(token, chat_id)
             trades = load_trades()
             
-            # Nabız Mesajı
             if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-                send_telegram_message(token, chat_id, "🦁 **Aslan Nöbette...**\nSistem aktif, tarama sürüyor. ⏳")
+                send_telegram_message(token, chat_id, "🦁 Nöbetteyim...")
                 last_heartbeat = time.time()
             
             for symbol in SYMBOL_LIST:
                 if symbol in trades: continue
-                signal, score, price, atr = analyze_market(symbol)
                 
-                # BARAJ 55 OLDU (Musluklar Açıldı)
-                if score >= MIN_SCORE and signal in ["LONG", "SHORT"]:
-                    sl = price - (atr * 1.5) if signal == "LONG" else price + (atr * 1.5)
-                    tp = price + (atr * 3.0) if signal == "LONG" else price - (atr * 3.0)
-                    
+                signal, price, tp, sl = analyze_price_action(symbol)
+                
+                if signal in ["LONG", "SHORT"]:
                     emoji = "🟢" if signal == "LONG" else "🔴"
+                    
+                    # --- MİNİMAL MESAJ FORMATI ---
                     msg = (
-                        f"🦁 **#{symbol.replace('/USDT', '')} | {signal}** {emoji}\n\n"
-                        f"📍 **Giriş:** {price:.4f}\n"
-                        f"🎯 **Hedef:** {tp:.4f}\n"
-                        f"🛑 **Stop:** {sl:.4f}\n"
-                        f"🔥 **Skor:** %{score}\n"
-                        f"⚠️ _Binance'ten Takip Et!_"
+                        f"🦁 **#{symbol.replace('/USDT', '')} | {signal}** {emoji}\n"
+                        f"💰 {price}\n"
+                        f"🎯 {tp:.4f}\n"
+                        f"🛡️ {sl:.4f}"
                     )
+                    
                     send_telegram_message(token, chat_id, msg)
                     trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
                     save_trades(trades)
