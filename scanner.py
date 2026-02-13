@@ -99,4 +99,11 @@ def monitor_trades_thread(token, chat_id):
                 time.sleep(TRADE_CHECK_INTERVAL)
                 continue
 
-            updated_trades = trades.
+            # HATA BURADAYDI, DÜZELDİ:
+            updated_trades = trades.copy()
+            trades_changed = False
+
+            for symbol, trade in trades.items():
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
