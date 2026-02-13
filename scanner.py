@@ -10,15 +10,15 @@ import threading
 from datetime import datetime
 from flask import Flask
 
-# --- [ PIRANHA (TOP 50 SCALP) AYARLARI ] ---
-TIMEFRAME = '5m'           # Hızlı Vur-Kaç için 5 dakikalık grafik
+# --- [ PIRANHA (AGRESİF SCALP) AYARLARI ] ---
+TIMEFRAME = '5m'           # 5 Dakikalık (Hızlı)
 LOOKBACK = 100             
-SCAN_INTERVAL = 10         # Liste uzun olduğu için bekleme süresini kıstık
+SCAN_INTERVAL = 10         # 10 Saniyede bir tara
 TRADE_CHECK_INTERVAL = 5   
 STATS_FILE = "daily_stats_render.json"  
 TRADES_FILE = "active_trades_render.json"
-TOP_COUNT = 50             # En hacimli 50 coin taranacak
-CACHE_REFRESH = 900        # Listeyi 15 dakikada bir yenile (Binance'i yormamak için)
+TOP_COUNT = 50             # İlk 50 Coin
+CACHE_REFRESH = 900        
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
@@ -33,7 +33,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 @app.route('/')
-def home(): return "☁️ PIRANHA v16.2 (TOP 50) ONLINE"
+def home(): return "☁️ PIRANHA v16.3 AGGRESSIVE ONLINE"
 
 def run_flask():
     try:
@@ -44,7 +44,7 @@ def run_flask():
 def send_telegram(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        # HTML modu ile hatasız gönderim
+        # HTML modu (Hatasız)
         data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         requests.post(url, data=data, timeout=10)
     except Exception as e: logger.error(f"Telegram Hatası: {e}")
@@ -99,164 +99,4 @@ def monitor_trades_thread(token, chat_id):
                 time.sleep(TRADE_CHECK_INTERVAL)
                 continue
 
-            updated_trades = trades.copy()
-            trades_changed = False
-
-            for symbol, trade in trades.items():
-                try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    current_price = ticker['last']
-                    symbol_short = symbol.replace('/USDT', '')
-                    
-                    # KAR AL
-                    if (trade['signal'] == "LONG" and current_price >= trade['tp']) or \
-                       (trade['signal'] == "SHORT" and current_price <= trade['tp']):
-                        
-                        pnl = abs((current_price - trade['entry']) / trade['entry']) * 100
-                        msg = (f"☁️ {symbol_short}\n"
-                               f"✅ Cepte\n"
-                               f"💰 %{pnl:.2f}\n"
-                               f"💎 Piranha")
-                        
-                        send_telegram(token, chat_id, msg)
-                        update_stats("WIN", pnl)
-                        del updated_trades[symbol]
-                        trades_changed = True
-                    
-                    # STOP OL
-                    elif (trade['signal'] == "LONG" and current_price <= trade['sl']) or \
-                         (trade['signal'] == "SHORT" and current_price >= trade['sl']):
-                        
-                        loss = abs((current_price - trade['entry']) / trade['entry']) * 100
-                        msg = (f"☁️ {symbol_short}\n"
-                               f"❌ Stop\n"
-                               f"📉 -%{loss:.2f}\n"
-                               f"💎 Piranha")
-                        
-                        send_telegram(token, chat_id, msg)
-                        update_stats("LOSS", -loss)
-                        del updated_trades[symbol]
-                        trades_changed = True
-                        
-                except: continue
-            
-            if trades_changed:
-                save_json(TRADES_FILE, updated_trades)
-
-        except: pass
-        time.sleep(TRADE_CHECK_INTERVAL)
-
-# --- [ BEYİN: TOP 50 HACİM LİSTESİ ] ---
-def get_top_volume_symbols():
-    try:
-        tickers = exchange.fetch_tickers()
-        # Sadece USDT çiftlerini al ve hacme göre sırala
-        usdt_tickers = [{'symbol': s, 'quoteVolume': float(v['quoteVolume'])} for s, v in tickers.items() if '/USDT' in s and 'quoteVolume' in v]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: x['quoteVolume'], reverse=True)
-        # İlk 50 coini döndür
-        return [t['symbol'] for t in sorted_tickers[:TOP_COUNT]]
-    except: 
-        # Hata olursa varsayılan liste
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
-
-# --- [ STRATEJİ: BOLLINGER SCALP ] ---
-def analyze_scalp(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LOOKBACK)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        if len(df) < 25: return "NEUTRAL", 0, 0, 0, 0
-
-        current_price = df['close'].iloc[-1]
-        bb = ta.bbands(df['close'], length=20, std=2)
-        lower_band = bb['BBL_20_2.0'].iloc[-1]
-        upper_band = bb['BBU_20_2.0'].iloc[-1]
-        middle_band = bb['BBM_20_2.0'].iloc[-1]
-        rsi = ta.rsi(df['close'], length=14).iloc[-1]
-        
-        signal = "NEUTRAL"; tp = 0; sl = 0; score = 50
-
-        # LONG (Bant Dışı + RSI Dip)
-        if current_price <= lower_band and rsi < 35:
-            signal = "LONG"
-            tp = middle_band 
-            sl = lower_band * 0.992
-            score = 80 + (35 - rsi)
-
-        # SHORT (Bant Dışı + RSI Tepe)
-        elif current_price >= upper_band and rsi > 65:
-            signal = "SHORT"
-            tp = middle_band
-            sl = upper_band * 1.008
-            score = 80 + (rsi - 65)
-
-        return signal, current_price, tp, sl, min(int(score), 99)
-    except: return "ERROR", 0, 0, 0, 0
-
-# --- [ ANA DÖNGÜ (run) ] ---
-def run(token, chat_id):
-    threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    logger.info("☁️ PIRANHA ONLINE (TOP 50)")
-    send_telegram(token, chat_id, "☁️ PIRANHA: ONLINE\nv16.2 | Top 50 Scalp")
-    
-    last_heartbeat = time.time()
-    last_cache_time = 0
-    symbol_list = []
-    last_report_date = datetime.now().day
-
-    while True:
-        try:
-            # Nabız
-            if time.time() - last_heartbeat > 1800:
-                send_telegram(token, chat_id, "☁️ Piranha Online | ⚡")
-                last_heartbeat = time.time()
-
-            # Rapor
-            if datetime.now().day != last_report_date:
-                send_daily_report(token, chat_id)
-                last_report_date = datetime.now().day
-
-            # Listeyi Yenile (15 dakikada bir)
-            if time.time() - last_cache_time > CACHE_REFRESH:
-                symbol_list = get_top_volume_symbols()
-                last_cache_time = time.time()
-                logger.info(f"Top 50 Liste Yenilendi: {len(symbol_list)} coin")
-
-            trades = load_json(TRADES_FILE)
-
-            # Dinamik Listeyi Tara
-            for symbol in symbol_list:
-                if symbol in trades: continue 
-
-                signal, price, tp, sl, score = analyze_scalp(symbol)
-
-                # Güven Skoru 80 ve üzeri
-                if signal in ["LONG", "SHORT"] and score >= 80:
-                    symbol_short = symbol.replace('/USDT', '')
-                    emoji = "🟢 LONG" if signal == "LONG" else "🔴 SHORT"
-                    
-                    msg = (f"☁️ {symbol_short} | 💎 %{score}\n"
-                           f"{emoji}\n"
-                           f"📍 {price}\n"
-                           f"🎯 {tp:.4f}\n"
-                           f"🛡️ {sl:.4f}")
-                    
-                    send_telegram(token, chat_id, msg)
-                    
-                    trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
-                    save_json(TRADES_FILE, trades)
-                    
-                    time.sleep(1) # Hızlı geçiş
-
-            time.sleep(SCAN_INTERVAL)
-
-        except Exception as e:
-            logger.error(f"Hata: {e}")
-            time.sleep(10)
-
-if __name__ == "__main__":
-    MY_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
-    MY_ID = "8120732989"
-    run(MY_TOKEN, MY_ID)
+            updated_trades = trades.
