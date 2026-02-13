@@ -11,13 +11,13 @@ from datetime import datetime
 from flask import Flask
 
 # --- [ PIRANHA (AGRESİF SCALP) AYARLARI ] ---
-TIMEFRAME = '5m'           
+TIMEFRAME = '5m'           # 5 Dakikalık (Hızlı)
 LOOKBACK = 100             
-SCAN_INTERVAL = 10         
+SCAN_INTERVAL = 10         # 10 Saniyede bir tara
 TRADE_CHECK_INTERVAL = 5   
 STATS_FILE = "daily_stats_render.json"  
 TRADES_FILE = "active_trades_render.json"
-TOP_COUNT = 50             
+TOP_COUNT = 50             # İlk 50 Coin
 CACHE_REFRESH = 900        
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -33,7 +33,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 @app.route('/')
-def home(): return "☁️ PIRANHA v16.3 ONLINE"
+def home(): return "☁️ PIRANHA v16.3 AGGRESSIVE ONLINE"
 
 def run_flask():
     try:
@@ -44,6 +44,7 @@ def run_flask():
 def send_telegram(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
+        # HTML modu (Hatasız)
         data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         requests.post(url, data=data, timeout=10)
     except Exception as e: logger.error(f"Telegram Hatası: {e}")
@@ -74,6 +75,7 @@ def update_stats(result, pnl):
     stats["pnl"] += pnl
     save_json(STATS_FILE, stats)
 
+# --- [ RAPORLAMA ] ---
 def send_daily_report(token, chat_id):
     stats = load_json(STATS_FILE)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -97,7 +99,7 @@ def monitor_trades_thread(token, chat_id):
                 time.sleep(TRADE_CHECK_INTERVAL)
                 continue
 
-            # --- HATA DÜZELTİLDİ: .copy() EKLENDİ ---
+            # Senin kodundaki DOĞRU satır:
             updated_trades = trades.copy()
             trades_changed = False
 
@@ -145,7 +147,7 @@ def monitor_trades_thread(token, chat_id):
         except: pass
         time.sleep(TRADE_CHECK_INTERVAL)
 
-# --- [ BEYİN: TOP 50 ] ---
+# --- [ BEYİN: TOP 50 HACİM LİSTESİ ] ---
 def get_top_volume_symbols():
     try:
         tickers = exchange.fetch_tickers()
@@ -155,8 +157,102 @@ def get_top_volume_symbols():
     except: 
         return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 
-# --- [ STRATEJİ: AGRESİF ] ---
+# --- [ STRATEJİ: AGRESİF BOLLINGER SCALP (GÜNCELLENDİ) ] ---
 def analyze_scalp(symbol):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LOOKBACK)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', '
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        if len(df) < 25: return "NEUTRAL", 0, 0, 0, 0
+
+        current_price = df['close'].iloc[-1]
+        bb = ta.bbands(df['close'], length=20, std=2)
+        lower_band = bb['BBL_20_2.0'].iloc[-1]
+        upper_band = bb['BBU_20_2.0'].iloc[-1]
+        middle_band = bb['BBM_20_2.0'].iloc[-1]
+        rsi = ta.rsi(df['close'], length=14).iloc[-1]
+        
+        signal = "NEUTRAL"; tp = 0; sl = 0; score = 50
+
+        # LONG (RSI < 40 OLARAK GÜNCELLENDİ)
+        if current_price <= lower_band and rsi < 40:
+            signal = "LONG"
+            tp = middle_band 
+            sl = lower_band * 0.992
+            score = 80 + (40 - rsi) 
+
+        # SHORT (RSI > 60 OLARAK GÜNCELLENDİ)
+        elif current_price >= upper_band and rsi > 60:
+            signal = "SHORT"
+            tp = middle_band
+            sl = upper_band * 1.008
+            score = 80 + (rsi - 60) 
+
+        return signal, current_price, tp, sl, min(int(score), 99)
+    except: return "ERROR", 0, 0, 0, 0
+
+# --- [ ANA DÖNGÜ (run) ] ---
+def run(token, chat_id):
+    threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    logger.info("☁️ PIRANHA ONLINE (AGRESİF)")
+    send_telegram(token, chat_id, "☁️ PIRANHA: ONLINE\nv16.3 | Agresif Mod")
+    
+    last_heartbeat = time.time()
+    last_cache_time = 0
+    symbol_list = []
+    last_report_date = datetime.now().day
+
+    while True:
+        try:
+            # Nabız (30 dk)
+            if time.time() - last_heartbeat > 1800:
+                send_telegram(token, chat_id, "☁️ Piranha Online | ⚡")
+                last_heartbeat = time.time()
+
+            if datetime.now().day != last_report_date:
+                send_daily_report(token, chat_id)
+                last_report_date = datetime.now().day
+
+            # Liste Yenileme (15 dk)
+            if time.time() - last_cache_time > CACHE_REFRESH:
+                symbol_list = get_top_volume_symbols()
+                last_cache_time = time.time()
+
+            trades = load_json(TRADES_FILE)
+
+            # Dinamik Liste Tarama
+            for symbol in symbol_list:
+                if symbol in trades: continue 
+
+                signal, price, tp, sl, score = analyze_scalp(symbol)
+
+                # Güven Skoru 80 üzeri
+                if signal in ["LONG", "SHORT"] and score >= 80:
+                    symbol_short = symbol.replace('/USDT', '')
+                    emoji = "🟢 LONG" if signal == "LONG" else "🔴 SHORT"
+                    
+                    msg = (f"☁️ {symbol_short} | 💎 %{score}\n"
+                           f"{emoji}\n"
+                           f"📍 {price}\n"
+                           f"🎯 {tp:.4f}\n"
+                           f"🛡️ {sl:.4f}")
+                    
+                    send_telegram(token, chat_id, msg)
+                    
+                    trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
+                    save_json(TRADES_FILE, trades)
+                    
+                    time.sleep(1)
+
+            time.sleep(SCAN_INTERVAL)
+
+        except Exception as e:
+            logger.error(f"Hata: {e}")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    MY_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
+    MY_ID = "8120732989"
+    run(MY_TOKEN, MY_ID)
