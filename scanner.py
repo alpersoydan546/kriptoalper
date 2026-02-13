@@ -10,28 +10,26 @@ import threading
 from datetime import datetime
 from flask import Flask
 
-# --- [ PIRANHA v18.1 - STABLE & UNCHAINED AYARLARI ] ---
-TIMEFRAME = '5m'           # Mikro Scalp
-LOOKBACK = 100             
-SCAN_INTERVAL = 15         # 15 saniye ideal
-TRADE_CHECK_INTERVAL = 5   
-STATS_FILE = "daily_stats_v18.json"  
-TRADES_FILE = "active_trades_v18.json"
-TOP_COUNT = 50             
+# --- [ PIRANHA v17.0 - LIQUIDITY HUNTER AYARLARI ] ---
+# Strateji: Range Scalp (Yatay Piyasa Vur-Kaç)
+TIMEFRAME = '5m'
+LOOKBACK = 50              # Range tespiti için son 50 mum
+ADX_MAX_THRESHOLD = 25     # 25 Üstü Trenddir, Piranha çalışmaz (Sniper'ın işi)
+WICK_RATIO = 2.0           # İğne/Gövde oranı (Fakeout tespiti)
+RISK_REWARD = 1.5          # Scalp için 1.5R yeterli
+CONFIDENCE_THRESHOLD = 70  # 70 Puan altı girme
 
-# --- [ RİSK YÖNETİMİ (GÜNCELLENDİ) ] ---
-MAX_OPEN_TRADES = 10       # LİMİT ARTIRILDI: Aynı anda 10 işlem
-DAILY_STOP_LOSS = -6.0     # %6 Zararda bot kapanır
-DAILY_TAKE_PROFIT = 5.0    # %5 Kârda bot kapanır (Hedef artırıldı)
-MAX_DAILY_LOSSES = 4       # Günlük 4 stopta bot 2 saat mola verir
-PAUSE_DURATION = 7200      # 2 Saat (saniye cinsinden)
+# Limitler
+SCAN_INTERVAL = 20         # Hızlı tarama
+MAX_DAILY_SIGNALS = 6      # Günde max 6 sinyal
+TIME_LIMIT_CANDLES = 20    # 20 Mumda (100 dk) sonuç yoksa ÇIK
+COIN_COOLDOWN = 10800      # Aynı coine 3 saat (10800 sn) küs
 
-# --- [ TP / SL AYARLARI (Sabit %) ] ---
-TP_PERCENT = 0.005         # %0.5 Fiyat Hareketi (10x ile %5 Kâr)
-SL_PERCENT = 0.0035        # %0.35 Fiyat Hareketi (10x ile %3.5 Zarar)
-
-# --- [ MARKET REJİMİ ] ---
-BTC_PROTECTION_PCT = 1.5   # BTC %1.5 düşerse Long açma
+# Dosya İsimleri
+STATS_FILE = "daily_stats_render.json"
+TRADES_FILE = "active_trades_render.json"
+TOP_COUNT = 50
+CACHE_REFRESH = 900
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
@@ -45,19 +43,8 @@ exchange = ccxt.binance({
 app = Flask(__name__)
 lock = threading.Lock()
 
-# Global Durum
-BOT_STATE = {
-    "is_paused": False,
-    "pause_end_time": 0,
-    "consecutive_losses": 0,
-    "daily_stopped": False
-}
-
 @app.route('/')
-def home(): 
-    status = "PAUSED" if BOT_STATE["is_paused"] else "RUNNING"
-    if BOT_STATE["daily_stopped"]: status = "STOPPED (DAILY LIMIT)"
-    return f"☁️ PIRANHA v18.1 UNCHAINED | Status: {status}"
+def home(): return "☁️ PIRANHA v17.0 LIQUIDITY ONLINE"
 
 def run_flask():
     try:
@@ -87,80 +74,53 @@ def save_json(filename, data):
             with open(filename, 'w') as f: json.dump(data, f, indent=4)
         except: pass
 
-def get_stats():
+def update_stats(result, pnl):
     stats = load_json(STATS_FILE)
     today = datetime.now().strftime("%Y-%m-%d")
     if stats.get("date") != today:
-        stats = {"date": today, "win": 0, "loss": 0, "pnl": 0.0, "total_trades": 0}
-        BOT_STATE["consecutive_losses"] = 0 
-        BOT_STATE["daily_stopped"] = False
-    return stats
-
-def update_stats(result, pnl):
-    stats = get_stats()
+        stats = {"date": today, "win": 0, "loss": 0, "timeout": 0, "pnl": 0.0, "daily_signals": 0}
     
-    if result == "WIN": 
-        stats["win"] += 1
-        BOT_STATE["consecutive_losses"] = 0 
-    elif result == "LOSS": 
-        stats["loss"] += 1
-        BOT_STATE["consecutive_losses"] += 1
+    if result == "WIN": stats["win"] += 1
+    elif result == "LOSS": stats["loss"] += 1
+    elif result == "TIMEOUT": stats.setdefault("timeout", 0); stats["timeout"] += 1
     
     stats["pnl"] += pnl
-    stats["total_trades"] += 1
     save_json(STATS_FILE, stats)
-    check_risk_management(stats) 
 
-# --- [ RİSK KONTROLÜ ] ---
-def check_risk_management(stats):
-    global BOT_STATE
+def send_daily_report(token, chat_id):
+    stats = load_json(STATS_FILE)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats.get("date") != today: return
     
-    if stats["pnl"] <= DAILY_STOP_LOSS:
-        BOT_STATE["daily_stopped"] = True
-        logger.warning("🚨 GÜNLÜK ZARAR LİMİTİ. STOP.")
-    
-    elif stats["pnl"] >= DAILY_TAKE_PROFIT:
-        BOT_STATE["daily_stopped"] = True
-        logger.info("🤑 GÜNLÜK KÂR LİMİTİ. PAYDOS.")
+    msg = (
+        f"☁️ Piranha\n"
+        f"🎯 {stats['win']} Hedef\n"
+        f"🛡️ {stats['loss']} Stop\n"
+        f"💰 %{stats['pnl']:.2f}"
+    )
+    send_telegram(token, chat_id, msg)
 
-    if BOT_STATE["consecutive_losses"] >= MAX_DAILY_LOSSES:
-        BOT_STATE["is_paused"] = True
-        BOT_STATE["pause_end_time"] = time.time() + PAUSE_DURATION
-        BOT_STATE["consecutive_losses"] = 0
-        logger.warning(f"⚠️ Arka arkaya stop! 2 Saat mola.")
+# --- [ COOLDOWN KONTROLÜ ] ---
+def check_cooldown(symbol, stats):
+    last_signals = stats.get("last_signals", {})
+    if symbol in last_signals:
+        if time.time() - last_signals[symbol] < COIN_COOLDOWN:
+            return True
+    return False
 
-# --- [ BTC REJİMİ ] ---
-def check_btc_regime():
-    try:
-        bars = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=5)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        start_price = df['open'].iloc[-3]
-        end_price = df['close'].iloc[-1]
-        change_pct = ((end_price - start_price) / start_price) * 100
-        
-        can_long = True
-        can_short = True
-        
-        if change_pct <= -BTC_PROTECTION_PCT: can_long = False  
-        if change_pct >= BTC_PROTECTION_PCT: can_short = False  
-        
-        return can_long, can_short
-    except:
-        return True, True
-
-# --- [ BEKÇİ MODÜLÜ ] ---
+# --- [ BEKÇİ MODÜLÜ (ZAMAN LİMİTLİ) ] ---
 def monitor_trades_thread(token, chat_id):
     logger.info("🛡️ PIRANHA BEKÇİSİ AKTİF")
     while True:
         try:
             trades = load_json(TRADES_FILE)
             if not trades:
-                time.sleep(TRADE_CHECK_INTERVAL)
+                time.sleep(5)
                 continue
 
             updated_trades = trades.copy()
             trades_changed = False
+            current_time = time.time()
 
             for symbol, trade in trades.items():
                 try:
@@ -168,31 +128,58 @@ def monitor_trades_thread(token, chat_id):
                     current_price = ticker['last']
                     symbol_short = symbol.replace('/USDT', '')
                     
-                    # KAR AL
-                    if (trade['signal'] == "LONG" and current_price >= trade['tp']) or \
-                       (trade['signal'] == "SHORT" and current_price <= trade['tp']):
+                    pnl_pct = abs((current_price - trade['entry']) / trade['entry']) * 100
+                    
+                    # 1. ZAMAN LİMİTİ KONTROLÜ (Scalp Beklemez!)
+                    # 5m mum * 20 mum = 100 dakika (6000 saniye)
+                    time_elapsed = current_time - trade.get('entry_time', current_time)
+                    if time_elapsed > (TIME_LIMIT_CANDLES * 5 * 60):
+                        # Piyasadan Çık
+                        pnl_real = (current_price - trade['entry']) / trade['entry'] * 100
+                        if trade['signal'] == "SHORT": pnl_real = -pnl_real
                         
-                        pnl = TP_PERCENT * 100 * 10 
+                        emoji = "✅" if pnl_real > 0 else "⚠️"
                         msg = (f"☁️ {symbol_short}\n"
-                               f"✅ HEDEF ALINDI (TP)\n"
-                               f"💰 Kazanç: +%{pnl:.2f} (10x)\n"
-                               f"💎 Piranha v18.1")
+                               f"⏱️ Zaman Doldu (Exit)\n"
+                               f"{emoji} %{pnl_real:.2f}\n"
+                               f"✨ Piranha")
+                        
                         send_telegram(token, chat_id, msg)
-                        update_stats("WIN", TP_PERCENT * 100) 
+                        update_stats("TIMEOUT", pnl_real)
                         del updated_trades[symbol]
                         trades_changed = True
+                        continue
+
+                    # 2. KAR AL (TP)
+                    is_tp = False
+                    if trade['signal'] == "LONG" and current_price >= trade['tp']: is_tp = True
+                    if trade['signal'] == "SHORT" and current_price <= trade['tp']: is_tp = True
                     
-                    # STOP OL
-                    elif (trade['signal'] == "LONG" and current_price <= trade['sl']) or \
-                         (trade['signal'] == "SHORT" and current_price >= trade['sl']):
-                        
-                        loss = SL_PERCENT * 100 * 10 
+                    if is_tp:
                         msg = (f"☁️ {symbol_short}\n"
-                               f"❌ STOP LOSS\n"
-                               f"📉 Kayıp: -%{loss:.2f} (10x)\n"
-                               f"💎 Piranha v18.1")
+                               f"💎 Hedef Tamam\n"
+                               f"💰 %{pnl_pct:.2f}\n"
+                               f"✨ Piranha")
+                        
                         send_telegram(token, chat_id, msg)
-                        update_stats("LOSS", -(SL_PERCENT * 100))
+                        update_stats("WIN", pnl_pct)
+                        del updated_trades[symbol]
+                        trades_changed = True
+                        continue
+                    
+                    # 3. STOP OL (SL)
+                    is_sl = False
+                    if trade['signal'] == "LONG" and current_price <= trade['sl']: is_sl = True
+                    if trade['signal'] == "SHORT" and current_price >= trade['sl']: is_sl = True
+
+                    if is_sl:
+                        msg = (f"☁️ {symbol_short}\n"
+                               f"❌ Stop\n"
+                               f"📉 -%{pnl_pct:.2f}\n"
+                               f"✨ Piranha")
+                        
+                        send_telegram(token, chat_id, msg)
+                        update_stats("LOSS", -pnl_pct)
                         del updated_trades[symbol]
                         trades_changed = True
                         
@@ -202,9 +189,9 @@ def monitor_trades_thread(token, chat_id):
                 save_json(TRADES_FILE, updated_trades)
 
         except: pass
-        time.sleep(TRADE_CHECK_INTERVAL)
+        time.sleep(5)
 
-# --- [ TOP 50 LİSTESİ ] ---
+# --- [ BEYİN: TOP 50 ] ---
 def get_top_volume_symbols():
     try:
         tickers = exchange.fetch_tickers()
@@ -214,57 +201,116 @@ def get_top_volume_symbols():
     except: 
         return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 
-# --- [ STRATEJİ: v18 STABLE ] ---
-def analyze_stable(symbol, can_long, can_short):
+# --- [ STRATEJİ: LIQUIDITY SWEEP & RANGE SCALP ] ---
+def analyze_scalp(symbol):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LOOKBACK)
+        # Veri Çek (50 mum Range + biraz fazlası indikatörler için)
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        if len(df) < 25: return "NEUTRAL", 0, 0, 0, 0
+        if len(df) < 50: return None
 
-        current_price = df['close'].iloc[-1]
+        # 1. REJİM FİLTRESİ: Range Only (ADX < 25)
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_df is None or adx_df.empty: return None
+        current_adx = adx_df['ADX_14'].iloc[-1]
         
-        # 1. Volatilite (ATR) Kontrolü
+        if current_adx > ADX_MAX_THRESHOLD: return None # Trend var, Piranha girmez.
+        
+        # 2. RANGE TANIMLAMA (Son 50 mumun en yükseği/düşüğü)
+        # Mevcut mumu dahil etmiyoruz ki "Sweep" (temizlik) olup olmadığını görelim
+        past_50 = df[-51:-1] 
+        range_high = past_50['high'].max()
+        range_low = past_50['low'].min()
+        
+        current_candle = df.iloc[-1]
+        current_price = current_candle['close']
+        current_open = current_candle['open']
+        current_high = current_candle['high']
+        current_low = current_candle['low']
+        current_vol = current_candle['volume']
+        
+        # 3. LIQUIDITY SWEEP (Wick Oranı Hesabı)
+        body_size = abs(current_close := current_price - current_open)
+        upper_wick = current_high - max(current_price, current_open)
+        lower_wick = min(current_price, current_open) - current_low
+        
+        # Wick Ratio: İğne gövdeden en az 2 kat büyük olmalı
+        # Ayrıca fiyat Range dışına iğne atmış ama içine kapanmış olmalı
+        
+        signal = "NEUTRAL"
+        
+        # --- SHORT SETUP (Range High Sweep) ---
+        if current_high > range_high and current_price < range_high:
+            if upper_wick > (body_size * WICK_RATIO):
+                signal = "SHORT"
+        
+        # --- LONG SETUP (Range Low Sweep) ---
+        elif current_low < range_low and current_price > range_low:
+            if lower_wick > (body_size * WICK_RATIO):
+                signal = "LONG"
+                
+        if signal == "NEUTRAL": return None
+
+        # 4. PUANLAMA (Confidence)
+        score = 0
+        
+        # Range Puanı (30): Fiyat range sınırına ne kadar yakın?
+        score += 30 # Zaten sınırda olduğumuz için sinyal ürettik
+        
+        # Hacim Spike (20): Ortalama hacmin üstünde mi?
+        avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+        if current_vol > (avg_vol * 1.2): score += 20
+        
+        # RSI Divergence Kontrolü (Basitleştirilmiş) (20)
+        rsi = ta.rsi(df['close'], length=14).iloc[-1]
+        if signal == "SHORT" and rsi > 60: score += 20 # Aşırı alım bölgesinden dönüş
+        if signal == "LONG" and rsi < 40: score += 20  # Aşırı satım bölgesinden dönüş
+        
+        # Volatilite/ATR Puanı (15)
         atr = ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1]
-        if atr < (current_price * 0.004): return "NEUTRAL", 0, 0, 0, 0 # Çok durgunsa girme
+        if atr > (current_price * 0.001): score += 15 # Ölü piyasa değil
         
-        # 2. Hacim Kontrolü
-        current_vol = df['volume'].iloc[-1]
-        avg_vol = df['volume'].rolling(window=20).mean().iloc[-1]
-        if current_vol < (avg_vol * 1.3): return "NEUTRAL", 0, 0, 0, 0 # Hacim yoksa girme
-
-        # 3. İndikatörler (BB 1.8 + RSI 7)
-        bb = ta.bbands(df['close'], length=14, std=1.8)
-        lower_band = bb['BBL_14_1.8'].iloc[-1]
-        upper_band = bb['BBU_14_1.8'].iloc[-1]
-        rsi = ta.rsi(df['close'], length=7).iloc[-1]
+        # ADX Puanı (15): ADX ne kadar düşükse o kadar iyi range
+        if current_adx < 15: score += 15
+        elif current_adx < 20: score += 10
         
-        signal = "NEUTRAL"; tp = 0; sl = 0; score = 60
+        if score < CONFIDENCE_THRESHOLD: return None
+        
+        # 5. DİNAMİK TP/SL (Scalp)
+        # SL: Range dışına %0.2 pay
+        # TP: 1.5R (Risk Reward)
+        
+        sl = 0; tp = 0
+        range_buffer = current_price * 0.002
+        
+        if signal == "LONG":
+            sl = range_low - range_buffer
+            risk = current_price - sl
+            tp = current_price + (risk * RISK_REWARD)
+        elif signal == "SHORT":
+            sl = range_high + range_buffer
+            risk = sl - current_price
+            tp = current_price - (risk * RISK_REWARD)
+            
+        return {
+            "signal": signal,
+            "score": score,
+            "price": current_price,
+            "sl": sl,
+            "tp": tp,
+            "entry_time": time.time()
+        }
 
-        # LONG
-        if can_long and current_price <= lower_band and rsi < 30:
-            signal = "LONG"
-            score = 80 + (30 - rsi)
-            tp = current_price * (1 + TP_PERCENT)
-            sl = current_price * (1 - SL_PERCENT)
-
-        # SHORT
-        elif can_short and current_price >= upper_band and rsi > 70:
-            signal = "SHORT"
-            score = 80 + (rsi - 70)
-            tp = current_price * (1 - TP_PERCENT)
-            sl = current_price * (1 + SL_PERCENT)
-
-        return signal, current_price, tp, sl, min(int(score), 99)
-    except: return "ERROR", 0, 0, 0, 0
+    except Exception as e: return None
 
 # --- [ ANA DÖNGÜ ] ---
 def run(token, chat_id):
     threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    logger.info("☁️ PIRANHA v18.1 ONLINE")
-    send_telegram(token, chat_id, "☁️ PIRANHA v18.1\nUnchained Stable Mode 🛡️\nMax 10 İşlem")
+    logger.info("☁️ PIRANHA ONLINE (LIQUIDITY)")
+    send_telegram(token, chat_id, "☁️ Piranha: Aktif")
     
     last_heartbeat = time.time()
     last_cache_time = 0
@@ -273,65 +319,64 @@ def run(token, chat_id):
 
     while True:
         try:
-            # 1. Kontroller
-            if BOT_STATE["daily_stopped"]:
-                time.sleep(60)
-                continue
-            
-            if BOT_STATE["is_paused"]:
-                if time.time() > BOT_STATE["pause_end_time"]:
-                    BOT_STATE["is_paused"] = False
-                    send_telegram(token, chat_id, "🔔 Piranha Moladan Döndü.")
-                else:
-                    time.sleep(60)
-                    continue
-
-            # 2. Nabız
-            if time.time() - last_heartbeat > 1800:
-                send_telegram(token, chat_id, "☁️ Piranha v18.1 | Aktif ⚡")
+            # Nabız: 6 SAAT
+            if time.time() - last_heartbeat > 21600:
+                send_telegram(token, chat_id, "☁️ Piranha Online | ⚡")
                 last_heartbeat = time.time()
 
+            # Gün Sonu Raporu
             if datetime.now().day != last_report_date:
-                save_json(STATS_FILE, {"date": datetime.now().strftime("%Y-%m-%d"), "win": 0, "loss": 0, "pnl": 0.0, "total_trades": 0})
-                BOT_STATE["daily_stopped"] = False
+                send_daily_report(token, chat_id)
                 last_report_date = datetime.now().day
 
-            # 3. Liste Yenile
+            # Liste Yenileme
             if time.time() - last_cache_time > CACHE_REFRESH:
                 symbol_list = get_top_volume_symbols()
                 last_cache_time = time.time()
 
-            # 4. BTC Durumu
-            can_long, can_short = check_btc_regime()
-
             trades = load_json(TRADES_FILE)
+            stats = load_json(STATS_FILE)
             
-            # Max 10 İşlem Kontrolü
-            if len(trades) >= MAX_OPEN_TRADES:
-                time.sleep(SCAN_INTERVAL)
+            # Günlük Limit
+            if stats.get("daily_signals", 0) >= MAX_DAILY_SIGNALS:
+                time.sleep(300)
                 continue
 
             for symbol in symbol_list:
                 if symbol in trades: continue 
+                if check_cooldown(symbol, stats): continue
 
-                signal, price, tp, sl, score = analyze_stable(symbol, can_long, can_short)
+                result = analyze_scalp(symbol)
 
-                if signal in ["LONG", "SHORT"]:
+                if result:
                     symbol_short = symbol.replace('/USDT', '')
-                    emoji = "🟢 LONG" if signal == "LONG" else "🔴 SHORT"
+                    emoji = "🟢 LONG" if result['signal'] == "LONG" else "🔴 SHORT"
                     
-                    msg = (f"☁️ {symbol_short} | 💎 %{score}\n"
-                           f"{emoji}\n"
-                           f"📍 Giriş: {price}\n"
-                           f"🎯 Hedef: {tp:.4f} (%0.5)\n"
-                           f"🛡️ Stop: {sl:.4f} (%0.35)")
+                    # YENİ FORMAT (LİKİDİTE VURGULU)
+                    msg = (f"☁️ {symbol_short} | 💎 %{result['score']} (Range)\n"
+                           f"{emoji} (Liquidity Sweep)\n"
+                           f"📍 {result['price']}\n"
+                           f"🎯 {result['tp']:.4f}\n"
+                           f"🛡️ {result['sl']:.4f}")
                     
                     send_telegram(token, chat_id, msg)
                     
-                    trades[symbol] = {"signal": signal, "entry": price, "tp": tp, "sl": sl}
+                    trades[symbol] = {
+                        "signal": result['signal'], 
+                        "entry": result['price'], 
+                        "tp": result['tp'], 
+                        "sl": result['sl'],
+                        "entry_time": result['entry_time']
+                    }
                     save_json(TRADES_FILE, trades)
                     
-                    if len(trades) >= MAX_OPEN_TRADES: break 
+                    # İstatistik ve Cooldown
+                    stats.setdefault("daily_signals", 0)
+                    stats["daily_signals"] += 1
+                    stats.setdefault("last_signals", {})
+                    stats["last_signals"][symbol] = time.time()
+                    save_json(STATS_FILE, stats)
+                    
                     time.sleep(1)
 
             time.sleep(SCAN_INTERVAL)
