@@ -231,7 +231,8 @@ def analyze_scalp(symbol):
         current_vol = current_candle['volume']
         
         # 3. LIQUIDITY SWEEP (Wick Oranı Hesabı)
-        body_size = abs(current_close := current_price - current_open)
+        current_close = current_price - current_open
+        body_size = abs(current_close)
         upper_wick = current_high - max(current_price, current_open)
         lower_wick = min(current_price, current_open) - current_low
         
