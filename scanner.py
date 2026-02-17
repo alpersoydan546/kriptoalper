@@ -38,6 +38,7 @@ TELEGRAM_CHAT_ID = "8120732989"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger()
 
+# FLASK (En Başta Tanımla)
 app = Flask(__name__)
 lock = threading.Lock()
 
@@ -61,20 +62,8 @@ def save_json(filename, data):
         try: with open(filename, 'w') as f: json.dump(data, f, indent=4)
         except: pass
 
-# --- [ BORSA ] ---
-def connect_exchange():
-    try:
-        exchange = ccxt.binance({'rateLimit': 1200, 'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-        exchange.load_markets()
-        return exchange
-    except:
-        time.sleep(5)
-        return connect_exchange()
-
-exchange = connect_exchange()
-
 # --- [ ANALİZ MOTORU ] ---
-def analyze_scalp(symbol):
+def analyze_scalp(exchange, symbol):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
         if not bars or len(bars) < 50: return None
@@ -119,16 +108,28 @@ def analyze_scalp(symbol):
 
 # --- [ ARKA PLAN İŞÇİSİ (BOT) ] ---
 def bot_loop():
-    logger.info("☁️ PIRANHA THREAD BAŞLADI")
-    send_telegram("☁️ <b>PIRANHA v19.2 (Render Fix)</b>\nSistem Online 🚀")
-    
+    # Gecikmeli Başlatma (Flask'ın portu kapmasına izin ver)
+    time.sleep(3) 
+    logger.info("☁️ PIRANHA: Borsa Bağlantısı Kuruluyor...")
+
+    # BORSA BAĞLANTISI (Burada Yapıyoruz ki Render Beklemesin)
+    exchange = None
+    while exchange is None:
+        try:
+            exchange = ccxt.binance({'rateLimit': 1200, 'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+            exchange.load_markets()
+            logger.info("✅ Borsa Bağlandı!")
+        except Exception as e:
+            logger.error(f"⚠️ Borsa Bağlantı Hatası: {e} | 5sn Bekleniyor...")
+            time.sleep(5)
+
+    send_telegram("☁️ <b>PIRANHA v19.3 (Fast Boot)</b>\nSistem Online 🚀")
     last_report_day = datetime.now().day
 
     while True:
         try:
             stats = load_json(STATS_FILE)
             if datetime.now().day != last_report_day:
-                # Günlük Rapor (Basitleştirilmiş)
                 msg = f"☁️ Piranha Rapor\n🎯 {stats.get('win', 0)} | 🛡️ {stats.get('loss', 0)} | 💰 %{stats.get('pnl', 0.0):.2f}"
                 send_telegram(msg)
                 stats = {"date": datetime.now().strftime("%Y-%m-%d"), "win": 0, "loss": 0, "timeout": 0, "pnl": 0.0, "daily_signals": 0, "last_signals": stats.get("last_signals", {})}
@@ -148,7 +149,6 @@ def bot_loop():
                     if trade['signal'] == "SHORT": pnl = -pnl
                     
                     res = None
-                    # Stop / TP / Timeout Kontrolü
                     if (trade['signal']=="LONG" and curr_price<=trade['sl']) or (trade['signal']=="SHORT" and curr_price>=trade['sl']): res="LOSS"
                     elif (trade['signal']=="LONG" and curr_price>=trade['tp']) or (trade['signal']=="SHORT" and curr_price<=trade['tp']): res="WIN"
                     elif (time.time() - trade['entry_time']) > (TIME_LIMIT_CANDLES * 300): res="TIMEOUT"
@@ -184,10 +184,11 @@ def bot_loop():
                     if symbol in trades: continue
                     if symbol in stats.get("last_signals", {}) and (time.time() - stats["last_signals"][symbol] < COIN_COOLDOWN): continue
                     
-                    res = analyze_scalp(symbol)
+                    # Exchange objesini fonksiyona geçiriyoruz
+                    res = analyze_scalp(exchange, symbol)
                     if res:
                         sym_clean = symbol.replace("/USDT", "")
-                        sweep = "🟢 (Sweep)" if res['signal'] == "LONG" else "🔴 (Sweep)"
+                        sweep = "🟢 (Liquidity Sweep)" if res['signal'] == "LONG" else "🔴 (Liquidity Sweep)"
                         msg = f"☁️ {sym_clean} | 💎 %{res['score']} (Range)\n{sweep}\n📍 {res['price']}\n🎯 {res['tp']:.4f}\n🛡️ {res['sl']:.4f}"
                         send_telegram(msg)
                         
@@ -208,12 +209,12 @@ def bot_loop():
 # --- [ FLASK (PATRON) ] ---
 @app.route('/')
 def home():
-    return "☁️ PIRANHA v19.2 RUNNING"
+    return "☁️ PIRANHA v19.3 RUNNING"
 
-# Botu arka planda başlat
+# Botu arka planda başlat (DAEMON)
 threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Render PORT değişkenini dinler
+    # Render PORT'unu hemen dinle
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
