@@ -13,19 +13,21 @@ from flask import Flask
 
 # --- [ PIRANHA - LİKİDİTE AVCISI (RANGE) ] ---
 
-# AYARLAR
+# AYARLAR (Gevşetilmiş & RSI Eklenmiş)
 TIMEFRAME = '5m'
 LOOKBACK = 50
-ADX_MAX_THRESHOLD = 25      # Yatay piyasa (Trend yok)
-WICK_RATIO = 2.0            # İğne oranı (Gövdenin 2 katı iğne lazım)
-CONFIDENCE_THRESHOLD = 70   # Giriş puanı
+ADX_MAX_THRESHOLD = 30      # 25'ten 30'a çektim (Daha çok fırsat)
+WICK_RATIO = 1.6            # 2.0'dan 1.6'ya çektim (Daha hassas iğne avı)
+RSI_OVERSOLD = 35           # RSI 35 altı (Long Bölgesi)
+RSI_OVERBOUGHT = 65         # RSI 65 üstü (Short Bölgesi)
+CONFIDENCE_THRESHOLD = 65   # Giriş puanını biraz rahatlattım
 
 # LİMİTLER
 SCAN_INTERVAL = 15          # Tarama hızı
-MAX_DAILY_SIGNALS = 15      # Günlük limit
+MAX_DAILY_SIGNALS = 20      # Günlük limit
 TIME_LIMIT_CANDLES = 12     # Zaman aşımı (12 mum = 1 saat)
-COIN_COOLDOWN = 3600        # 1 Saatlik ban
-TOP_COUNT = 60              # Taranacak coin sayısı
+COIN_COOLDOWN = 1800        # 1 Saatten 30 dakikaya indirdim (Seri işlem)
+TOP_COUNT = 70              # Taranacak coin sayısı
 
 # DOSYA YOLLARI
 STATS_FILE = "piranha_stats.json"
@@ -38,13 +40,12 @@ logging.basicConfig(
     format='%(asctime)s - [PIRANHA] - %(message)s',
     datefmt='%H:%M:%S',
     handlers=[
-        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger()
 
-# --- [ BORSA BAĞLANTISI (RETRY MEKANİZMALI) ] ---
+# --- [ BORSA BAĞLANTISI (RETRY) ] ---
 def connect_exchange():
     try:
         exchange = ccxt.binance({
@@ -66,7 +67,7 @@ lock = threading.Lock()
 
 # --- [ FLASK (Render İçin) ] ---
 @app.route('/')
-def home(): return "☁️ PIRANHA ONLINE"
+def home(): return "☁️ PIRANHA v19.0 ONLINE"
 
 def run_flask():
     try:
@@ -74,7 +75,7 @@ def run_flask():
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except: pass
 
-# --- [ TELEGRAM MOTORU ] ---
+# --- [ TELEGRAM MOTORU (DEBUG MODU) ] ---
 def send_telegram(token, chat_id, message):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -84,9 +85,16 @@ def send_telegram(token, chat_id, message):
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
-        requests.post(url, data=data, timeout=10)
+        # Hata ayıklama için response kontrolü
+        response = requests.post(url, data=data, timeout=15)
+        
+        if response.status_code != 200:
+            logger.error(f"❌ Telegram Gönderilemedi! Kod: {response.status_code}, Hata: {response.text}")
+        else:
+            logger.info("✅ Telegram Mesajı İletildi.")
+            
     except Exception as e: 
-        logger.error(f"Telegram Hatası: {e}")
+        logger.error(f"❌ Telegram Bağlantı Hatası: {e}")
 
 # --- [ DOSYA İŞLEMLERİ ] ---
 def load_json(filename):
@@ -131,7 +139,7 @@ def monitor_trades_thread(token, chat_id):
         try:
             trades = load_json(TRADES_FILE)
             if not trades:
-                time.sleep(5)
+                time.sleep(10)
                 continue
 
             updated_trades = trades.copy()
@@ -154,7 +162,6 @@ def monitor_trades_thread(token, chat_id):
                     if (trade['signal'] == "LONG" and current_price <= trade['sl']) or \
                        (trade['signal'] == "SHORT" and current_price >= trade['sl']):
                         result_type = "LOSS"
-                        # ANAYASA FORMATI: LOSS
                         msg = (f"☁️ {symbol_short}\n"
                                f"❌ Stop\n"
                                f"📉 -%{abs(raw_pnl):.2f}\n"
@@ -164,7 +171,6 @@ def monitor_trades_thread(token, chat_id):
                     elif (trade['signal'] == "LONG" and current_price >= trade['tp']) or \
                          (trade['signal'] == "SHORT" and current_price <= trade['tp']):
                         result_type = "WIN"
-                        # ANAYASA FORMATI: WIN
                         msg = (f"☁️ {symbol_short}\n"
                                f"💎 Hedef Tamam\n"
                                f"💰 %{raw_pnl:.2f}\n"
@@ -174,7 +180,6 @@ def monitor_trades_thread(token, chat_id):
                     elif (current_time - trade['entry_time']) > (TIME_LIMIT_CANDLES * 5 * 60):
                         result_type = "TIMEOUT"
                         emoji = "🟢" if raw_pnl > 0 else "🔴"
-                        # ANAYASA FORMATI: TIMEOUT
                         msg = (f"☁️ {symbol_short}\n"
                                f"⏱️ Zaman Doldu (Exit)\n"
                                f"{emoji} %{raw_pnl:.2f}\n"
@@ -199,7 +204,7 @@ def monitor_trades_thread(token, chat_id):
         
         time.sleep(5)
 
-# --- [ TEKNİK ANALİZ MOTORU ] ---
+# --- [ TEKNİK ANALİZ MOTORU (YENİ RSI FİLTRESİ) ] ---
 def analyze_scalp(symbol):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
@@ -207,14 +212,18 @@ def analyze_scalp(symbol):
         
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # ADX (Trend Zayıflığı Kontrolü - Range Piyasası)
+        # 1. ADX (Trend Zayıflığı - Range Kontrolü)
         adx = df.ta.adx(length=14)
         if adx is None or adx.empty: return None
         current_adx = adx['ADX_14'].iloc[-1]
         
-        if current_adx > ADX_MAX_THRESHOLD: return None # Trend varsa girme
+        if current_adx > ADX_MAX_THRESHOLD: return None # Trend çok güçlüyse girme
 
-        # Mum İğne Analizi (Liquidity Sweep)
+        # 2. RSI Hesapla
+        rsi = df.ta.rsi(length=14).iloc[-1]
+        if rsi is None: return None
+
+        # 3. Mum İğne Analizi (Liquidity Sweep)
         row = df.iloc[-1]
         body = abs(row['close'] - row['open'])
         upper_wick = row['high'] - max(row['open'], row['close'])
@@ -222,26 +231,29 @@ def analyze_scalp(symbol):
         
         signal = "NEUTRAL"
         
-        # Aşağı uzun iğne -> Likidite alındı, Long dön
-        if lower_wick > (body * WICK_RATIO): signal = "LONG"
-        # Yukarı uzun iğne -> Likidite alındı, Short dön
-        elif upper_wick > (body * WICK_RATIO): signal = "SHORT"
+        # --- LONG STRATEJİSİ ---
+        # Aşağı uzun iğne VAR VE RSI Aşırı Satımda (Oversold)
+        if (lower_wick > (body * WICK_RATIO)) and (rsi < RSI_OVERSOLD):
+            signal = "LONG"
+            
+        # --- SHORT STRATEJİSİ ---
+        # Yukarı uzun iğne VAR VE RSI Aşırı Alımda (Overbought)
+        elif (upper_wick > (body * WICK_RATIO)) and (rsi > RSI_OVERBOUGHT):
+            signal = "SHORT"
             
         if signal == "NEUTRAL": return None
 
-        # Puanlama
-        score = 50
-        rsi = df.ta.rsi(length=14).iloc[-1]
+        # Puanlama (Confidence Score)
+        score = 60 # Başlangıç puanı (Şartlar sağlandığı için)
         
+        # Ekstra Güven Puanları
         if signal == "LONG":
-            if rsi < 30: score += 20
-            elif rsi < 40: score += 10
-            if lower_wick > (body * 3): score += 15
+            if rsi < 25: score += 15 # RSI dipteyse ekstra puan
+            if lower_wick > (body * 2.5): score += 15 # İğne çok uzunsa
             
         elif signal == "SHORT":
-            if rsi > 70: score += 20
-            elif rsi > 60: score += 10
-            if upper_wick > (body * 3): score += 15
+            if rsi > 75: score += 15 # RSI tepedeyse ekstra puan
+            if upper_wick > (body * 2.5): score += 15
 
         if score < CONFIDENCE_THRESHOLD: return None
 
@@ -263,12 +275,10 @@ def analyze_scalp(symbol):
 # --- [ GÜNLÜK RAPOR ] ---
 def send_daily_report(token, chat_id):
     stats = load_json(STATS_FILE)
-    # ANAYASA FORMATI: RAPOR
     msg = (f"☁️ Piranha\n"
            f"🎯 {stats.get('win', 0)} Hedef\n"
            f"🛡️ {stats.get('loss', 0)} Stop\n"
            f"💰 %{stats.get('pnl', 0.0):.2f}")
-    
     send_telegram(token, chat_id, msg)
     
     new_stats = {
@@ -284,22 +294,29 @@ def run_piranha(token, chat_id):
     threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
     
     logger.info("☁️ PIRANHA GÖREVE BAŞLADI")
-    send_telegram(token, chat_id, "☁️ <b>Piranha Online</b>\nLikidite Avı Başladı 🚀")
+    
+    # --- BAŞLANGIÇ TEST MESAJI (ZORUNLU) ---
+    logger.info("Telegram testi yapılıyor...")
+    send_telegram(token, chat_id, "☁️ <b>PIRANHA v19.0 (RSI Update)</b>\nSistem Başlatıldı, Filtreler Ayarlandı 🚀")
     
     last_report_day = datetime.now().day
 
     while True:
         try:
             stats = load_json(STATS_FILE)
+            
+            # Günlük rapor kontrolü
+            if datetime.now().day != last_report_day:
+                send_daily_report(token, chat_id)
+                last_report_day = datetime.now().day
+                
+            # Limit kontrolü
             if stats.get("daily_signals", 0) >= MAX_DAILY_SIGNALS:
                 logger.info("Günlük limit doldu, bekleniyor...")
                 time.sleep(600)
                 continue
 
-            if datetime.now().day != last_report_day:
-                send_daily_report(token, chat_id)
-                last_report_day = datetime.now().day
-
+            # Tarama Listesi
             try:
                 tickers = exchange.fetch_tickers()
                 symbols = [s for s in tickers if "/USDT" in s and "quoteVolume" in tickers[s]]
@@ -317,42 +334,11 @@ def run_piranha(token, chat_id):
                 
                 if result:
                     symbol_clean = symbol.replace("/USDT", "")
-                    # ANAYASA FORMATI: SİNYAL
-                    # Sinyal: ☁️ {symbol} | 💎 %{score} (Range)\n{emoji} (Liquidity Sweep)\n📍 {price}\n🎯 {tp}\n🛡️ {sl}
                     
+                    # Sinyal Mesajı
                     sweep_text = "🟢 (Liquidity Sweep)" if result['signal'] == "LONG" else "🔴 (Liquidity Sweep)"
                     
                     msg = (f"☁️ {symbol_clean} | 💎 %{result['score']} (Range)\n"
                            f"{sweep_text}\n"
                            f"📍 {result['price']}\n"
-                           f"🎯 {result['tp']:.4f}\n"
-                           f"🛡️ {result['sl']:.4f}")
-                    
-                    send_telegram(token, chat_id, msg)
-                    logger.info(f"Sinyal: {symbol} {result['signal']}")
-                    
-                    trades[symbol] = result
-                    save_json(TRADES_FILE, trades)
-                    
-                    stats["daily_signals"] = stats.get("daily_signals", 0) + 1
-                    stats["last_signals"][symbol] = time.time()
-                    save_json(STATS_FILE, stats)
-                
-                time.sleep(1.5) # API Limiti
-
-            logger.info("Tarama turu bitti...")
-            time.sleep(SCAN_INTERVAL)
-
-        except KeyboardInterrupt:
-            print("Kapatılıyor...")
-            break
-        except Exception as e:
-            logger.error(f"Döngü Hatası: {e}")
-            time.sleep(10)
-
-if __name__ == "__main__":
-    # --- AYARLAR ---
-    TELEGRAM_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
-    TELEGRAM_CHAT_ID = "8120732989"
-    
-    run_piranha(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+                           f"🎯 {result['tp']
