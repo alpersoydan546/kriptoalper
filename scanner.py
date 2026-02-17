@@ -7,214 +7,386 @@ import logging
 import json
 import os
 import threading
-import sys
 from datetime import datetime
 from flask import Flask
 
-# --- [ PIRANHA - LİKİDİTE AVCISI ] ---
-
-# AYARLAR
+# --- [ PIRANHA v17.0 - LIQUIDITY HUNTER AYARLARI ] ---
+# Strateji: Range Scalp (Yatay Piyasa Vur-Kaç)
 TIMEFRAME = '5m'
-ADX_MAX_THRESHOLD = 30
-WICK_RATIO = 1.6
-RSI_OVERSOLD = 35
-RSI_OVERBOUGHT = 65
-CONFIDENCE_THRESHOLD = 65
+LOOKBACK = 50              # Range tespiti için son 50 mum
+ADX_MAX_THRESHOLD = 25     # 25 Üstü Trenddir, Piranha çalışmaz (Sniper'ın işi)
+WICK_RATIO = 2.0           # İğne/Gövde oranı (Fakeout tespiti)
+RISK_REWARD = 1.5          # Scalp için 1.5R yeterli
+CONFIDENCE_THRESHOLD = 70  # 70 Puan altı girme
 
-# LİMİTLER
-SCAN_INTERVAL = 15
-MAX_DAILY_SIGNALS = 20
-TIME_LIMIT_CANDLES = 12
-COIN_COOLDOWN = 1800
-TOP_COUNT = 70
+# Limitler
+SCAN_INTERVAL = 20         # Hızlı tarama
+MAX_DAILY_SIGNALS = 6      # Günde max 6 sinyal
+TIME_LIMIT_CANDLES = 20    # 20 Mumda (100 dk) sonuç yoksa ÇIK
+COIN_COOLDOWN = 10800      # Aynı coine 3 saat (10800 sn) küs
 
-# DOSYA SİSTEMİ
-STATS_FILE = "piranha_stats.json"
-TRADES_FILE = "piranha_trades.json"
-TELEGRAM_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
-TELEGRAM_CHAT_ID = "8120732989"
+# Dosya İsimleri
+STATS_FILE = "daily_stats_render.json"
+TRADES_FILE = "active_trades_render.json"
+TOP_COUNT = 50
+CACHE_REFRESH = 900
 
-# LOGLAMA
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
-# FLASK (En Başta Tanımla)
+exchange = ccxt.binance({
+    'rateLimit': 1200,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
+
 app = Flask(__name__)
 lock = threading.Lock()
 
-# --- [ TELEGRAM ] ---
-def send_telegram(message):
+@app.route('/')
+def home(): return "☁️ PIRANHA v17.0 LIQUIDITY ONLINE"
+
+def run_flask():
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host='0.0.0.0', port=port)
+    except: pass
+
+def send_telegram(token, chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         requests.post(url, data=data, timeout=10)
     except Exception as e: logger.error(f"Telegram Hatası: {e}")
 
 # --- [ DOSYA YÖNETİMİ ] ---
 def load_json(filename):
     with lock:
-        if not os.path.exists(filename): return {}
-        try: with open(filename, 'r') as f: return json.load(f)
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r') as f: return json.load(f)
+            return {}
         except: return {}
 
 def save_json(filename, data):
     with lock:
-        try: with open(filename, 'w') as f: json.dump(data, f, indent=4)
+        try:
+            with open(filename, 'w') as f: json.dump(data, f, indent=4)
         except: pass
 
-# --- [ ANALİZ MOTORU ] ---
-def analyze_scalp(exchange, symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
-        if not bars or len(bars) < 50: return None
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+def update_stats(result, pnl):
+    stats = load_json(STATS_FILE)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats.get("date") != today:
+        stats = {"date": today, "win": 0, "loss": 0, "timeout": 0, "pnl": 0.0, "daily_signals": 0}
+    
+    if result == "WIN": stats["win"] += 1
+    elif result == "LOSS": stats["loss"] += 1
+    elif result == "TIMEOUT": stats.setdefault("timeout", 0); stats["timeout"] += 1
+    
+    stats["pnl"] += pnl
+    save_json(STATS_FILE, stats)
 
-        # ADX
-        adx = df.ta.adx(length=14)
-        if adx is None or adx.empty: return None
-        if adx['ADX_14'].iloc[-1] > ADX_MAX_THRESHOLD: return None
+def send_daily_report(token, chat_id):
+    stats = load_json(STATS_FILE)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats.get("date") != today: return
+    
+    msg = (
+        f"☁️ Piranha\n"
+        f"🎯 {stats['win']} Hedef\n"
+        f"🛡️ {stats['loss']} Stop\n"
+        f"💰 %{stats['pnl']:.2f}"
+    )
+    send_telegram(token, chat_id, msg)
 
-        # RSI & WICK
-        rsi = df.ta.rsi(length=14).iloc[-1]
-        row = df.iloc[-1]
-        body = abs(row['close'] - row['open'])
-        upper_wick = row['high'] - max(row['open'], row['close'])
-        lower_wick = min(row['open'], row['close']) - row['low']
+# --- [ COOLDOWN KONTROLÜ ] ---
+def check_cooldown(symbol, stats):
+    last_signals = stats.get("last_signals", {})
+    if symbol in last_signals:
+        if time.time() - last_signals[symbol] < COIN_COOLDOWN:
+            return True
+    return False
 
-        signal = "NEUTRAL"
-        if (lower_wick > (body * WICK_RATIO)) and (rsi < RSI_OVERSOLD): signal = "LONG"
-        elif (upper_wick > (body * WICK_RATIO)) and (rsi > RSI_OVERBOUGHT): signal = "SHORT"
-        
-        if signal == "NEUTRAL": return None
-
-        # SCORE
-        score = 60
-        if signal == "LONG":
-            if rsi < 25: score += 15
-            if lower_wick > (body * 2.5): score += 15
-        elif signal == "SHORT":
-            if rsi > 75: score += 15
-            if upper_wick > (body * 2.5): score += 15
-            
-        if score < CONFIDENCE_THRESHOLD: return None
-
-        # HEDEFLER
-        atr = df.ta.atr(length=14).iloc[-1]
-        sl = row['close'] - (atr * 1.5) if signal == "LONG" else row['close'] + (atr * 1.5)
-        tp = row['close'] + (atr * 2.25) if signal == "LONG" else row['close'] - (atr * 2.25)
-
-        return {"signal": signal, "score": score, "price": row['close'], "sl": sl, "tp": tp, "entry_time": time.time()}
-    except: return None
-
-# --- [ ARKA PLAN İŞÇİSİ (BOT) ] ---
-def bot_loop():
-    # Gecikmeli Başlatma (Flask'ın portu kapmasına izin ver)
-    time.sleep(3) 
-    logger.info("☁️ PIRANHA: Borsa Bağlantısı Kuruluyor...")
-
-    # BORSA BAĞLANTISI (Burada Yapıyoruz ki Render Beklemesin)
-    exchange = None
-    while exchange is None:
-        try:
-            exchange = ccxt.binance({'rateLimit': 1200, 'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-            exchange.load_markets()
-            logger.info("✅ Borsa Bağlandı!")
-        except Exception as e:
-            logger.error(f"⚠️ Borsa Bağlantı Hatası: {e} | 5sn Bekleniyor...")
-            time.sleep(5)
-
-    send_telegram("☁️ <b>PIRANHA v19.3 (Fast Boot)</b>\nSistem Online 🚀")
-    last_report_day = datetime.now().day
-
+# --- [ BEKÇİ MODÜLÜ (ZAMAN LİMİTLİ) ] ---
+def monitor_trades_thread(token, chat_id):
+    logger.info("🛡️ PIRANHA BEKÇİSİ AKTİF")
     while True:
         try:
-            stats = load_json(STATS_FILE)
-            if datetime.now().day != last_report_day:
-                msg = f"☁️ Piranha Rapor\n🎯 {stats.get('win', 0)} | 🛡️ {stats.get('loss', 0)} | 💰 %{stats.get('pnl', 0.0):.2f}"
-                send_telegram(msg)
-                stats = {"date": datetime.now().strftime("%Y-%m-%d"), "win": 0, "loss": 0, "timeout": 0, "pnl": 0.0, "daily_signals": 0, "last_signals": stats.get("last_signals", {})}
-                save_json(STATS_FILE, stats)
-                last_report_day = datetime.now().day
-
-            # BEKÇİ (Monitor)
             trades = load_json(TRADES_FILE)
+            if not trades:
+                time.sleep(5)
+                continue
+
             updated_trades = trades.copy()
             trades_changed = False
-            
+            current_time = time.time()
+
             for symbol, trade in trades.items():
                 try:
                     ticker = exchange.fetch_ticker(symbol)
-                    curr_price = float(ticker['last'])
-                    pnl = (curr_price - trade['entry']) / trade['entry'] * 100
-                    if trade['signal'] == "SHORT": pnl = -pnl
+                    current_price = ticker['last']
+                    symbol_short = symbol.replace('/USDT', '')
                     
-                    res = None
-                    if (trade['signal']=="LONG" and curr_price<=trade['sl']) or (trade['signal']=="SHORT" and curr_price>=trade['sl']): res="LOSS"
-                    elif (trade['signal']=="LONG" and curr_price>=trade['tp']) or (trade['signal']=="SHORT" and curr_price<=trade['tp']): res="WIN"
-                    elif (time.time() - trade['entry_time']) > (TIME_LIMIT_CANDLES * 300): res="TIMEOUT"
+                    pnl_pct = abs((current_price - trade['entry']) / trade['entry']) * 100
                     
-                    if res:
-                        sym_clean = symbol.replace('/USDT', '')
-                        if res == "LOSS": msg = f"☁️ {sym_clean}\n❌ Stop\n📉 -%{abs(pnl):.2f}\n✨ Piranha"
-                        elif res == "WIN": msg = f"☁️ {sym_clean}\n💎 Hedef Tamam\n💰 %{pnl:.2f}\n✨ Piranha"
-                        else: msg = f"☁️ {sym_clean}\n⏱️ Zaman Doldu\n{'🟢' if pnl>0 else '🔴'} %{pnl:.2f}\n✨ Piranha"
+                    # 1. ZAMAN LİMİTİ KONTROLÜ (Scalp Beklemez!)
+                    # 5m mum * 20 mum = 100 dakika (6000 saniye)
+                    time_elapsed = current_time - trade.get('entry_time', current_time)
+                    if time_elapsed > (TIME_LIMIT_CANDLES * 5 * 60):
+                        # Piyasadan Çık
+                        pnl_real = (current_price - trade['entry']) / trade['entry'] * 100
+                        if trade['signal'] == "SHORT": pnl_real = -pnl_real
                         
-                        send_telegram(msg)
-                        if res == "WIN": stats["win"] += 1
-                        elif res == "LOSS": stats["loss"] += 1
-                        stats["pnl"] += pnl
-                        save_json(STATS_FILE, stats)
+                        emoji = "✅" if pnl_real > 0 else "⚠️"
+                        msg = (f"☁️ {symbol_short}\n"
+                               f"⏱️ Zaman Doldu (Exit)\n"
+                               f"{emoji} %{pnl_real:.2f}\n"
+                               f"✨ Piranha")
+                        
+                        send_telegram(token, chat_id, msg)
+                        update_stats("TIMEOUT", pnl_real)
                         del updated_trades[symbol]
                         trades_changed = True
-                except: pass
-            
-            if trades_changed: save_json(TRADES_FILE, updated_trades)
+                        continue
 
-            # TARAMA (Scanner)
-            if stats.get("daily_signals", 0) < MAX_DAILY_SIGNALS:
-                try:
-                    tickers = exchange.fetch_tickers()
-                    symbols = [s for s in tickers if "/USDT" in s and tickers[s]['quoteVolume'] > 0]
-                    symbols.sort(key=lambda x: tickers[x]['quoteVolume'], reverse=True)
-                    target_list = symbols[:TOP_COUNT]
-                except: target_list = []
-
-                for symbol in target_list:
-                    trades = load_json(TRADES_FILE)
-                    if symbol in trades: continue
-                    if symbol in stats.get("last_signals", {}) and (time.time() - stats["last_signals"][symbol] < COIN_COOLDOWN): continue
+                    # 2. KAR AL (TP)
+                    is_tp = False
+                    if trade['signal'] == "LONG" and current_price >= trade['tp']: is_tp = True
+                    if trade['signal'] == "SHORT" and current_price <= trade['tp']: is_tp = True
                     
-                    # Exchange objesini fonksiyona geçiriyoruz
-                    res = analyze_scalp(exchange, symbol)
-                    if res:
-                        sym_clean = symbol.replace("/USDT", "")
-                        sweep = "🟢 (Liquidity Sweep)" if res['signal'] == "LONG" else "🔴 (Liquidity Sweep)"
-                        msg = f"☁️ {sym_clean} | 💎 %{res['score']} (Range)\n{sweep}\n📍 {res['price']}\n🎯 {res['tp']:.4f}\n🛡️ {res['sl']:.4f}"
-                        send_telegram(msg)
+                    if is_tp:
+                        msg = (f"☁️ {symbol_short}\n"
+                               f"💎 Hedef Tamam\n"
+                               f"💰 %{pnl_pct:.2f}\n"
+                               f"✨ Piranha")
                         
-                        trades[symbol] = res
-                        save_json(TRADES_FILE, trades)
-                        stats["daily_signals"] = stats.get("daily_signals", 0) + 1
-                        if "last_signals" not in stats: stats["last_signals"] = {}
-                        stats["last_signals"][symbol] = time.time()
-                        save_json(STATS_FILE, stats)
-                        time.sleep(2)
-                    time.sleep(1)
+                        send_telegram(token, chat_id, msg)
+                        update_stats("WIN", pnl_pct)
+                        del updated_trades[symbol]
+                        trades_changed = True
+                        continue
+                    
+                    # 3. STOP OL (SL)
+                    is_sl = False
+                    if trade['signal'] == "LONG" and current_price <= trade['sl']: is_sl = True
+                    if trade['signal'] == "SHORT" and current_price >= trade['sl']: is_sl = True
+
+                    if is_sl:
+                        msg = (f"☁️ {symbol_short}\n"
+                               f"❌ Stop\n"
+                               f"📉 -%{pnl_pct:.2f}\n"
+                               f"✨ Piranha")
+                        
+                        send_telegram(token, chat_id, msg)
+                        update_stats("LOSS", -pnl_pct)
+                        del updated_trades[symbol]
+                        trades_changed = True
+                        
+                except: continue
             
+            if trades_changed:
+                save_json(TRADES_FILE, updated_trades)
+
+        except: pass
+        time.sleep(5)
+
+# --- [ BEYİN: TOP 50 ] ---
+def get_top_volume_symbols():
+    try:
+        tickers = exchange.fetch_tickers()
+        usdt_tickers = [{'symbol': s, 'quoteVolume': float(v['quoteVolume'])} for s, v in tickers.items() if '/USDT' in s and 'quoteVolume' in v]
+        sorted_tickers = sorted(usdt_tickers, key=lambda x: x['quoteVolume'], reverse=True)
+        return [t['symbol'] for t in sorted_tickers[:TOP_COUNT]]
+    except: 
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
+
+# --- [ STRATEJİ: LIQUIDITY SWEEP & RANGE SCALP ] ---
+def analyze_scalp(symbol):
+    try:
+        # Veri Çek (50 mum Range + biraz fazlası indikatörler için)
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        if len(df) < 50: return None
+
+        # 1. REJİM FİLTRESİ: Range Only (ADX < 25)
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_df is None or adx_df.empty: return None
+        current_adx = adx_df['ADX_14'].iloc[-1]
+        
+        if current_adx > ADX_MAX_THRESHOLD: return None # Trend var, Piranha girmez.
+        
+        # 2. RANGE TANIMLAMA (Son 50 mumun en yükseği/düşüğü)
+        # Mevcut mumu dahil etmiyoruz ki "Sweep" (temizlik) olup olmadığını görelim
+        past_50 = df[-51:-1] 
+        range_high = past_50['high'].max()
+        range_low = past_50['low'].min()
+        
+        current_candle = df.iloc[-1]
+        current_price = current_candle['close']
+        current_open = current_candle['open']
+        current_high = current_candle['high']
+        current_low = current_candle['low']
+        current_vol = current_candle['volume']
+        
+        # 3. LIQUIDITY SWEEP (Wick Oranı Hesabı)
+        current_close = current_price - current_open
+        body_size = abs(current_close)
+        upper_wick = current_high - max(current_price, current_open)
+        lower_wick = min(current_price, current_open) - current_low
+        
+        # Wick Ratio: İğne gövdeden en az 2 kat büyük olmalı
+        # Ayrıca fiyat Range dışına iğne atmış ama içine kapanmış olmalı
+        
+        signal = "NEUTRAL"
+        
+        # --- SHORT SETUP (Range High Sweep) ---
+        if current_high > range_high and current_price < range_high:
+            if upper_wick > (body_size * WICK_RATIO):
+                signal = "SHORT"
+        
+        # --- LONG SETUP (Range Low Sweep) ---
+        elif current_low < range_low and current_price > range_low:
+            if lower_wick > (body_size * WICK_RATIO):
+                signal = "LONG"
+                
+        if signal == "NEUTRAL": return None
+
+        # 4. PUANLAMA (Confidence)
+        score = 0
+        
+        # Range Puanı (30): Fiyat range sınırına ne kadar yakın?
+        score += 30 # Zaten sınırda olduğumuz için sinyal ürettik
+        
+        # Hacim Spike (20): Ortalama hacmin üstünde mi?
+        avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+        if current_vol > (avg_vol * 1.2): score += 20
+        
+        # RSI Divergence Kontrolü (Basitleştirilmiş) (20)
+        rsi = ta.rsi(df['close'], length=14).iloc[-1]
+        if signal == "SHORT" and rsi > 60: score += 20 # Aşırı alım bölgesinden dönüş
+        if signal == "LONG" and rsi < 40: score += 20  # Aşırı satım bölgesinden dönüş
+        
+        # Volatilite/ATR Puanı (15)
+        atr = ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1]
+        if atr > (current_price * 0.001): score += 15 # Ölü piyasa değil
+        
+        # ADX Puanı (15): ADX ne kadar düşükse o kadar iyi range
+        if current_adx < 15: score += 15
+        elif current_adx < 20: score += 10
+        
+        if score < CONFIDENCE_THRESHOLD: return None
+        
+        # 5. DİNAMİK TP/SL (Scalp)
+        # SL: Range dışına %0.2 pay
+        # TP: 1.5R (Risk Reward)
+        
+        sl = 0; tp = 0
+        range_buffer = current_price * 0.002
+        
+        if signal == "LONG":
+            sl = range_low - range_buffer
+            risk = current_price - sl
+            tp = current_price + (risk * RISK_REWARD)
+        elif signal == "SHORT":
+            sl = range_high + range_buffer
+            risk = sl - current_price
+            tp = current_price - (risk * RISK_REWARD)
+            
+        return {
+            "signal": signal,
+            "score": score,
+            "price": current_price,
+            "sl": sl,
+            "tp": tp,
+            "entry_time": time.time()
+        }
+
+    except Exception as e: return None
+
+# --- [ ANA DÖNGÜ ] ---
+def run(token, chat_id):
+    threading.Thread(target=monitor_trades_thread, args=(token, chat_id), daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    logger.info("☁️ PIRANHA ONLINE (LIQUIDITY)")
+    send_telegram(token, chat_id, "☁️ Piranha: Aktif")
+    
+    last_heartbeat = time.time()
+    last_cache_time = 0
+    symbol_list = []
+    last_report_date = datetime.now().day
+
+    while True:
+        try:
+            # Nabız: 6 SAAT
+            if time.time() - last_heartbeat > 21600:
+                send_telegram(token, chat_id, "☁️ Piranha Online | ⚡")
+                last_heartbeat = time.time()
+
+            # Gün Sonu Raporu
+            if datetime.now().day != last_report_date:
+                send_daily_report(token, chat_id)
+                last_report_date = datetime.now().day
+
+            # Liste Yenileme
+            if time.time() - last_cache_time > CACHE_REFRESH:
+                symbol_list = get_top_volume_symbols()
+                last_cache_time = time.time()
+
+            trades = load_json(TRADES_FILE)
+            stats = load_json(STATS_FILE)
+            
+            # Günlük Limit
+            if stats.get("daily_signals", 0) >= MAX_DAILY_SIGNALS:
+                time.sleep(300)
+                continue
+
+            for symbol in symbol_list:
+                if symbol in trades: continue 
+                if check_cooldown(symbol, stats): continue
+
+                result = analyze_scalp(symbol)
+
+                if result:
+                    symbol_short = symbol.replace('/USDT', '')
+                    emoji = "🟢 LONG" if result['signal'] == "LONG" else "🔴 SHORT"
+                    
+                    # YENİ FORMAT (LİKİDİTE VURGULU)
+                    msg = (f"☁️ {symbol_short} | 💎 %{result['score']} (Range)\n"
+                           f"{emoji} (Liquidity Sweep)\n"
+                           f"📍 {result['price']}\n"
+                           f"🎯 {result['tp']:.4f}\n"
+                           f"🛡️ {result['sl']:.4f}")
+                    
+                    send_telegram(token, chat_id, msg)
+                    
+                    trades[symbol] = {
+                        "signal": result['signal'], 
+                        "entry": result['price'], 
+                        "tp": result['tp'], 
+                        "sl": result['sl'],
+                        "entry_time": result['entry_time']
+                    }
+                    save_json(TRADES_FILE, trades)
+                    
+                    # İstatistik ve Cooldown
+                    stats.setdefault("daily_signals", 0)
+                    stats["daily_signals"] += 1
+                    stats.setdefault("last_signals", {})
+                    stats["last_signals"][symbol] = time.time()
+                    save_json(STATS_FILE, stats)
+                    
+                    time.sleep(1)
+
             time.sleep(SCAN_INTERVAL)
+
         except Exception as e:
-            logger.error(f"Bot Döngü Hatası: {e}")
+            logger.error(f"Hata: {e}")
             time.sleep(10)
 
-# --- [ FLASK (PATRON) ] ---
-@app.route('/')
-def home():
-    return "☁️ PIRANHA v19.3 RUNNING"
-
-# Botu arka planda başlat (DAEMON)
-threading.Thread(target=bot_loop, daemon=True).start()
-
 if __name__ == "__main__":
-    # Render PORT'unu hemen dinle
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    MY_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
+    MY_ID = "8120732989"
+    run(MY_TOKEN, MY_ID)
