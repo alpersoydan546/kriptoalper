@@ -10,9 +10,9 @@ import threading
 from datetime import datetime
 from flask import Flask
 
-# --- [ PIRANHA v19.3 - ANTI-BAN & BULK FETCH ] ---
-# Sorun: Çok fazla açık işlem yüzünden API Rate Limit yeniyordu.
-# Çözüm: fetch_tickers ile tek seferde toplu fiyat çekimi yapıldı. Baraj yükseltildi.
+# --- [ PIRANHA v19.4 - STEALTH MODE (API OPTİMİZASYONU) ] ---
+# Sorun: 429 Too Many Requests (Binance IP Ban)
+# Çözüm: BTC trendi tek sefere düşürüldü, Bekçi loop dışına alındı, delay eklendi.
 
 # --- AYARLAR ---
 TIMEFRAME = '5m'
@@ -20,10 +20,10 @@ LOOKBACK = 50
 ADX_MAX_THRESHOLD = 25
 WICK_RATIO = 2.0
 RISK_REWARD = 1.5
-CONFIDENCE_THRESHOLD = 80  # 70'ten 80'e çıkarıldı (Sinyal spamını engellemek için)
+CONFIDENCE_THRESHOLD = 80  
 
 # --- LİMİTLER ---
-SCAN_INTERVAL = 15
+SCAN_INTERVAL = 30             # 15 -> 30 sn yapıldı (API yormamak için ideal)
 MAX_DAILY_SIGNALS = 9999
 TIME_LIMIT_CANDLES = 20
 COIN_COOLDOWN = 3600
@@ -38,7 +38,6 @@ TELEGRAM_CHAT_ID = DEFAULT_CHAT_ID
 # Dosyalar
 STATS_FILE = "daily_stats_render.json"
 TRADES_FILE = "active_trades_render.json"
-CACHE_REFRESH = 900
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [PIRANHA] - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger()
@@ -56,7 +55,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 @app.route('/')
-def home(): return "☁️ PIRANHA v19.3 ONLINE"
+def home(): return "☁️ PIRANHA v19.4 ONLINE"
 
 def run_flask():
     try:
@@ -104,6 +103,7 @@ def check_cooldown(symbol, stats):
             return True
     return False
 
+# YENİ: Tek seferde BTC Trendi alır
 def check_btc_correlation():
     try:
         btc = exchange.fetch_ohlcv('BTC/USDT', timeframe=TIMEFRAME, limit=2)
@@ -115,7 +115,6 @@ def check_btc_correlation():
         return "SAFE"
     except: return "SAFE"
 
-# --- [ BEKÇİ FONKSİYONU (YENİ: TOPLU FİYAT ÇEKİMİ) ] ---
 def check_active_trades():
     try:
         trades = load_json(TRADES_FILE)
@@ -125,7 +124,6 @@ def check_active_trades():
         trades_changed = False
         current_time = time.time()
         
-        # 37 kere tek tek sormak yerine, TEK BİR İSTEKLE hepsini çekiyoruz (Ban yememek için)
         try:
             trade_symbols = list(trades.keys())
             all_tickers = exchange.fetch_tickers(trade_symbols)
@@ -139,14 +137,12 @@ def check_active_trades():
                 current_price = float(all_tickers[symbol]['last'])
                 symbol_short = symbol.replace('/USDT', '')
                 
-                # PNL Hesapla
                 pnl_real = (current_price - trade['entry']) / trade['entry'] * 100
                 if trade['signal'] == "SHORT": pnl_real = -pnl_real
 
                 result_type = None
                 msg = ""
 
-                # 1. ZAMAN LİMİTİ (Exit)
                 if (current_time - trade['entry_time']) > (TIME_LIMIT_CANDLES * 5 * 60):
                     result_type = "TIMEOUT"
                     emoji = "✅" if pnl_real > 0 else "⚠️"
@@ -155,7 +151,6 @@ def check_active_trades():
                            f"{emoji} %{pnl_real:.2f}\n"
                            f"✨ Piranha")
 
-                # 2. KAR AL (TP)
                 elif (trade['signal'] == "LONG" and current_price >= trade['tp']) or \
                      (trade['signal'] == "SHORT" and current_price <= trade['tp']):
                     result_type = "WIN"
@@ -164,7 +159,6 @@ def check_active_trades():
                            f"💰 %{abs(pnl_real):.2f}\n"
                            f"✨ Piranha")
 
-                # 3. STOP OL (SL)
                 elif (trade['signal'] == "LONG" and current_price <= trade['sl']) or \
                      (trade['signal'] == "SHORT" and current_price >= trade['sl']):
                     result_type = "LOSS"
@@ -189,13 +183,12 @@ def check_active_trades():
     except Exception as e:
         logger.error(f"Genel Bekçi Hatası: {e}")
 
-def analyze_scalp(symbol):
+# YENİ: btc_status dışarıdan parametre olarak geliyor (API'yi yormamak için)
+def analyze_scalp(symbol, btc_status):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
         if not bars or len(bars) < 50: return None
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        btc_status = check_btc_correlation()
         
         adx = df.ta.adx(length=14)
         if adx is None or adx.empty or adx['ADX_14'].iloc[-1] > ADX_MAX_THRESHOLD: return None 
@@ -253,15 +246,15 @@ def run(token=None, chat_id=None):
 
     threading.Thread(target=run_flask, daemon=True).start()
     
-    logger.info("☁️ PIRANHA v19.3 ONLINE (ANTI-BAN)")
-    send_telegram("☁️ Piranha: Aktif (Anti-Ban Modu)")
+    logger.info("☁️ PIRANHA v19.4 ONLINE (STEALTH MODE)")
+    send_telegram("☁️ Piranha: Aktif (Stealth Modu)")
     
     last_report_day = datetime.now().day
     target_list = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
 
     while True:
         try:
-            # 1. BEKÇİ KONTROLÜ
+            # 1. BEKÇİ KONTROLÜ (Döngü başında SADECE 1 kere)
             check_active_trades()
 
             # 2. NABIZ VE RAPOR
@@ -280,26 +273,29 @@ def run(token=None, chat_id=None):
             except: pass
 
             stats = load_json(STATS_FILE)
+            
+            # YENİ: BTC Yönünü sadece 1 kere sor! (60 kere sormak yok)
+            global_btc_status = check_btc_correlation()
 
             # 4. TARAMA (AVCI)
             for symbol in target_list:
-                if target_list.index(symbol) % 10 == 0: check_active_trades()
-                
                 trades = load_json(TRADES_FILE)
                 if symbol in trades: continue
                 if check_cooldown(symbol, stats): continue
                 
-                result = analyze_scalp(symbol)
+                # BTC yönünü içeriye paslıyoruz
+                result = analyze_scalp(symbol, global_btc_status)
                 
                 if result:
                     symbol_short = symbol.replace("/USDT", "")
                     emoji = "🟢 LONG" if result['signal'] == "LONG" else "🔴 SHORT"
-                    # Bol sıfırlı coinler için format .6f yapıldı
+                    
+                    # 4. formatla birleştirildi (Hane sıfırları aynen korundu)
                     msg = (f"☁️ {symbol_short} | 💎 %{result['score']} (Range)\n"
                            f"{emoji} (Liquidity Sweep)\n"
                            f"📍 {result['price']}\n"
-                           f"🎯 {result['tp']:.6f}\n"
-                           f"🛡️ {result['sl']:.6f}")
+                           f"🎯 {result['tp']:.4f}\n"
+                           f"🛡️ {result['sl']:.4f}")
                     send_telegram(msg)
                     logger.info(f"Sinyal: {symbol}")
                     
@@ -311,9 +307,9 @@ def run(token=None, chat_id=None):
                     stats["last_signals"][symbol] = time.time()
                     save_json(STATS_FILE, stats)
                 
-                time.sleep(0.5)
+                time.sleep(1) # YENİ: Binance'i yormamak için her coin arasında 1 saniye nefes
 
-            time.sleep(SCAN_INTERVAL)
+            time.sleep(SCAN_INTERVAL) # YENİ: Döngü sonu beklemesi 30 sn.
 
         except Exception as e:
             logger.error(f"Ana Döngü Hatası: {e}")
