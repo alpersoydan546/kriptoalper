@@ -10,31 +10,29 @@ import threading
 from datetime import datetime
 from flask import Flask
 
-# --- [ PIRANHA v19.6 - STABLE & CLEAN ] ---
-# Syntax, indentation ve "entry" anahtarı problemleri kökten çözüldü.
+# --- [ PIRANHA v19.8 - BTC TREND FILTER ] ---
+# Sorun: BTC trendine karşı açılan işlemler stop oluyor, çok fazla sinyal spamı var.
+# Çözüm: 1H BTC Trend filtresi eklendi. Ana trende zıt işlem açılması yasaklandı.
 
-# --- AYARLAR ---
 TIMEFRAME = '5m'
 LOOKBACK = 50
 ADX_MAX_THRESHOLD = 25
-WICK_RATIO = 2.0
+ADX_MIN_THRESHOLD = 15     
+WICK_RATIO = 2.5           
 RISK_REWARD = 1.5
 CONFIDENCE_THRESHOLD = 80  
 
-# --- LİMİTLER ---
 SCAN_INTERVAL = 30
-MAX_DAILY_SIGNALS = 9999
+MAX_DAILY_SIGNALS = 15     
 TIME_LIMIT_CANDLES = 20
 COIN_COOLDOWN = 3600
-TOP_COUNT = 60
+TOP_COUNT = 15             
 
-# --- KİMLİK ---
 DEFAULT_TOKEN = "8498989500:AAGmk-2OBpal04K4i6ZMk6YaYNC79Fa_xac"
 DEFAULT_CHAT_ID = "8120732989"
 TELEGRAM_TOKEN = DEFAULT_TOKEN
 TELEGRAM_CHAT_ID = DEFAULT_CHAT_ID
 
-# Dosyalar
 STATS_FILE = "daily_stats_render.json"
 TRADES_FILE = "active_trades_render.json"
 
@@ -55,7 +53,7 @@ lock = threading.Lock()
 
 @app.route('/')
 def home(): 
-    return "☁️ PIRANHA v19.6 ONLINE"
+    return "☁️ PIRANHA v19.8 ONLINE"
 
 def run_flask():
     try:
@@ -110,18 +108,21 @@ def check_cooldown(symbol, stats):
             return True
     return False
 
-def check_btc_correlation():
+# YENİ: 1 Saatlik (1H) Ana Trend Kontrolü
+def get_btc_macro_trend():
     try:
-        btc = exchange.fetch_ohlcv('BTC/USDT', timeframe=TIMEFRAME, limit=2)
-        if not btc: return "NEUTRAL"
-        open_p = btc[-1][1]
-        close_p = btc[-1][4]
-        change = (close_p - open_p) / open_p * 100
-        if change < -0.2: return "DUMP"
-        elif change > 0.2: return "PUMP"
-        return "SAFE"
+        bars = exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=250)
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        ema50 = ta.ema(df['close'], length=50).iloc[-1]
+        ema200 = ta.ema(df['close'], length=200).iloc[-1]
+        
+        if ema50 > ema200: 
+            return "BULLISH" # BTC Yükselişte
+        elif ema50 < ema200: 
+            return "BEARISH" # BTC Düşüşte
+        return "NEUTRAL"
     except Exception: 
-        return "SAFE"
+        return "NEUTRAL"
 
 def check_active_trades():
     try:
@@ -158,7 +159,6 @@ def check_active_trades():
                 result_type = None
                 msg = ""
 
-                # 1. ZAMAN LİMİTİ
                 if (current_time - trade.get('entry_time', current_time)) > (TIME_LIMIT_CANDLES * 5 * 60):
                     result_type = "TIMEOUT"
                     emoji = "✅" if pnl_real > 0 else "⚠️"
@@ -167,7 +167,6 @@ def check_active_trades():
                            f"{emoji} %{pnl_real:.2f}\n"
                            f"✨ Piranha")
 
-                # 2. KAR AL
                 elif (trade.get('signal') == "LONG" and current_price >= trade.get('tp', 999999)) or \
                      (trade.get('signal') == "SHORT" and current_price <= trade.get('tp', 0)):
                     result_type = "WIN"
@@ -176,7 +175,6 @@ def check_active_trades():
                            f"💰 %{abs(pnl_real):.2f}\n"
                            f"✨ Piranha")
 
-                # 3. STOP
                 elif (trade.get('signal') == "LONG" and current_price <= trade.get('sl', 0)) or \
                      (trade.get('signal') == "SHORT" and current_price >= trade.get('sl', 999999)):
                     result_type = "LOSS"
@@ -193,16 +191,15 @@ def check_active_trades():
                     logger.info(f"İşlem Sonucu: {symbol} -> {result_type}")
 
             except Exception as e:
-                logger.error(f"Bekçi İç Döngü Hatası ({symbol}): {e}")
                 continue
         
         if trades_changed:
             save_json(TRADES_FILE, updated_trades)
 
     except Exception as e:
-        logger.error(f"Genel Bekçi Hatası: {e}")
+        pass
 
-def analyze_scalp(symbol, btc_status):
+def analyze_scalp(symbol, macro_trend):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
         if not bars or len(bars) < 50: 
@@ -210,7 +207,11 @@ def analyze_scalp(symbol, btc_status):
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         adx = df.ta.adx(length=14)
-        if adx is None or adx.empty or adx['ADX_14'].iloc[-1] > ADX_MAX_THRESHOLD: 
+        if adx is None or adx.empty: return None 
+        
+        current_adx = adx['ADX_14'].iloc[-1]
+        
+        if current_adx > ADX_MAX_THRESHOLD or current_adx < ADX_MIN_THRESHOLD: 
             return None 
 
         row = df.iloc[-1]
@@ -221,21 +222,26 @@ def analyze_scalp(symbol, btc_status):
         upper_wick = row['high'] - max(row['open'], row['close'])
         lower_wick = min(row['open'], row['close']) - row['low']
 
-        if lower_wick > wick_len and btc_status != "DUMP": signal = "LONG"
-        elif upper_wick > wick_len and btc_status != "PUMP": signal = "SHORT"
+        # YENİ: Makro trend filtresi eklendi! BTC Düşüyorsa Long açmak YASAK.
+        if lower_wick > wick_len and macro_trend != "BEARISH": signal = "LONG"
+        elif upper_wick > wick_len and macro_trend != "BULLISH": signal = "SHORT"
             
         if signal == "NEUTRAL": 
             return None
 
-        score = 50
+        score = 40 
         avg_vol = df['volume'].rolling(20).mean().iloc[-1]
-        if row['volume'] > (avg_vol * 1.5): score += 20 
+        
+        if row['volume'] > (avg_vol * 2.0): 
+            score += 25 
         
         if (signal == "LONG" and lower_wick > body * 3) or \
            (signal == "SHORT" and upper_wick > body * 3): score += 20
             
         rsi = df.ta.rsi(length=14).iloc[-1]
-        if (signal == "LONG" and rsi < 40) or (signal == "SHORT" and rsi > 60): score += 10
+        
+        if (signal == "LONG" and rsi < 35) or (signal == "SHORT" and rsi > 65): 
+            score += 15
 
         if score < CONFIDENCE_THRESHOLD: 
             return None
@@ -258,7 +264,8 @@ def send_daily_report():
         msg = (f"☁️ Piranha\n"
                f"🎯 {stats.get('win', 0)} Hedef\n"
                f"🛡️ {stats.get('loss', 0)} Stop\n"
-               f"💰 %{stats.get('pnl', 0.0):.2f}")
+               f"⏱️ {stats.get('timeout', 0)} Zaman Aşımı\n"
+               f"💰 PNL: %{stats.get('pnl', 0.0):.2f}")
         send_telegram(msg)
         new_stats = {"date": datetime.now().strftime("%Y-%m-%d"), "win": 0, "loss": 0, "timeout": 0, "pnl": 0.0, "daily_signals": 0, "last_signals": stats.get("last_signals", {})}
         save_json(STATS_FILE, new_stats)
@@ -272,18 +279,16 @@ def run(token=None, chat_id=None):
 
     threading.Thread(target=run_flask, daemon=True).start()
     
-    logger.info("☁️ PIRANHA v19.6 ONLINE (STABLE)")
-    send_telegram("☁️ Piranha: Aktif (Stabil Versiyon)")
+    logger.info("☁️ PIRANHA v19.8 ONLINE (TREND-ALIGNED)")
+    send_telegram("☁️ Piranha: Aktif (BTC Makro Trend Devrede)")
     
     last_report_day = datetime.now().day
     target_list = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
 
     while True:
         try:
-            # 1. BEKÇİ KONTROLÜ
             check_active_trades()
 
-            # 2. NABIZ VE RAPOR
             if int(time.time()) % 21600 == 0: 
                 send_telegram("☁️ Piranha Online | ⚡")
             
@@ -291,7 +296,6 @@ def run(token=None, chat_id=None):
                 send_daily_report()
                 last_report_day = datetime.now().day
 
-            # 3. LİSTE YENİLEME
             try:
                 if int(time.time()) % 600 == 0: 
                     tickers = exchange.fetch_tickers()
@@ -302,9 +306,14 @@ def run(token=None, chat_id=None):
                 pass
 
             stats = load_json(STATS_FILE)
-            global_btc_status = check_btc_correlation()
+            
+            if stats.get("daily_signals", 0) >= MAX_DAILY_SIGNALS:
+                time.sleep(300) 
+                continue
 
-            # 4. TARAMA (AVCI)
+            # YENİ: BTC Makro Trendi tur başında çekiliyor
+            macro_trend = get_btc_macro_trend()
+
             for symbol in target_list:
                 trades = load_json(TRADES_FILE)
                 if symbol in trades: 
@@ -312,7 +321,7 @@ def run(token=None, chat_id=None):
                 if check_cooldown(symbol, stats): 
                     continue
                 
-                result = analyze_scalp(symbol, global_btc_status)
+                result = analyze_scalp(symbol, macro_trend)
                 
                 if result:
                     symbol_short = symbol.replace("/USDT", "")
@@ -325,7 +334,7 @@ def run(token=None, chat_id=None):
                            f"🛡️ {result['sl']:.4f}")
                     
                     send_telegram(msg)
-                    logger.info(f"Sinyal: {symbol}")
+                    logger.info(f"Sinyal: {symbol} Yön: {result['signal']}")
                     
                     trades[symbol] = result
                     save_json(TRADES_FILE, trades)
